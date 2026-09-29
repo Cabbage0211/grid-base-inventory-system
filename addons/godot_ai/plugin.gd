@@ -1,0 +1,1901 @@
+@tool
+extends EditorPlugin
+
+const GAME_HELPER_AUTOLOAD_NAME := "_mcp_game_helper"
+const GAME_HELPER_AUTOLOAD_PATH := "res://addons/godot_ai/runtime/game_helper.gd"
+
+## Editor-process Logger subclass — captures parse errors, @tool runtime
+## errors, and push_error/push_warning so the LLM can read them via
+## `logs_read(source="editor")`.
+const EditorLogger := preload("res://addons/godot_ai/runtime/editor_logger.gd")
+
+const PluginReload := preload("res://addons/godot_ai/utils/plugin_reload.gd")
+const ReleaseVerifier := preload("res://addons/godot_ai/utils/release_verifier.gd")
+const UpdateInstaller := preload("res://addons/godot_ai/utils/update_installer.gd")
+const LIVE_ADDON_ROOT := "res://addons/godot_ai"
+const PLUGIN_CFG := "res://addons/godot_ai/plugin.cfg"
+const MIN_GODOT_MAJOR := 4
+const MIN_GODOT_MINOR := 7
+const UNSUPPORTED_GODOT_MESSAGE := \
+	"Godot AI v4 requires Godot 4.7 or newer in the 4.x line; plugin remains inactive."
+
+## The lifecycle manager owns the serialized server episode and process
+## authority. This root only captures its immutable launch plan and routes
+## copied snapshots/results to the connection and Dock.
+const ServerLifecycleManager := preload("res://addons/godot_ai/utils/server_lifecycle.gd")
+const PortResolver := preload("res://addons/godot_ai/utils/port_resolver.gd")
+const ServerStateScript := preload("res://addons/godot_ai/utils/mcp_server_state.gd")
+const TransportCapability := preload("res://addons/godot_ai/utils/transport_capability.gd")
+
+## Plugin-class scripts used by this file. The script-local preload aliases
+## are ordinary dependency shorthand and keep construction sites compact.
+## They are not the self-update safety boundary. Whole-tree namespace swaps
+## happen inside the editor; the live tree is renamed, never overlaid, and the
+## only disable/scan/enable; no script mutates the tree that contains itself.
+const Connection := preload("res://addons/godot_ai/connection.gd")
+const Dispatcher := preload("res://addons/godot_ai/dispatcher.gd")
+const Telemetry := preload("res://addons/godot_ai/telemetry.gd")
+const LogBuffer := preload("res://addons/godot_ai/utils/log_buffer.gd")
+const GameLogBuffer := preload("res://addons/godot_ai/utils/game_log_buffer.gd")
+const EditorLogBuffer := preload("res://addons/godot_ai/utils/editor_log_buffer.gd")
+const SurfacedErrorTracker := preload("res://addons/godot_ai/utils/surfaced_error_tracker.gd")
+const Dock := preload("res://addons/godot_ai/mcp_dock.gd")
+const DebuggerPlugin := preload("res://addons/godot_ai/debugger/mcp_debugger_plugin.gd")
+const VisionRoutingScript := preload("res://addons/godot_ai/vision_routing.gd")
+const ExportPlugin := preload("res://addons/godot_ai/export/mcp_export_plugin.gd")
+const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
+const CliExec := preload("res://addons/godot_ai/clients/_cli_exec.gd")
+const ClientJobOwner := preload("res://addons/godot_ai/utils/client_job_owner.gd")
+const UpdateManager := preload("res://addons/godot_ai/utils/update_manager.gd")
+const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
+const McpToolRegistry := preload("res://addons/godot_ai/custom_tools/mcp_tool_registry.gd")
+const McpServiceLocator := preload("res://addons/godot_ai/custom_tools/mcp_service_locator.gd")
+
+## Handlers are intentionally NOT preloaded here (#736). The old
+## `const X := preload("res://addons/godot_ai/handlers/...")` block pulled
+## every handler — and everything handlers preload — into plugin.gd's
+## compile closure, so Godot parsed/compiled ~119 addon scripts before the
+## first instruction of _enter_tree ran. GDScript has no cross-restart
+## compile cache, so that stalled "Initializing plugins" on every editor
+## boot and every plugin re-enable. Handlers are now registered by script
+## path via McpDispatcher.register_lazy_handler / register_lazy and are
+## load()ed at the first dispatch of one of their commands.
+##
+## Handlers remain preload-style scripts with no `class_name` so they don't
+## pollute the project-wide global scope (#253): a user project that happens
+## to define its own `InputHandler`, `SceneHandler`, etc. would otherwise
+## hard-error on plugin enable.
+const HANDLERS_DIR := "res://addons/godot_ai/handlers/"
+
+const STARTUP_TRACE_COUNTER_NAMES := [
+	"powershell",
+	"netstat",
+	"netsh",
+	"lsof",
+	"http_status_probe",
+	"server_command_discovery",
+]
+
+## Untyped on purpose — see policy below. Type fences move to handler `_init`
+## sites that take typed parameters.
+##
+## Self-update field and load-surface policy: plugin entry-load fields that
+## survive reload stay untyped. Typed fields against plugin-defined classes
+## were the #242 / #244 crash class: Godot can reparse a long-lived script
+## while its old field storage and the new type shape disagree. Static-var
+## initializers are the most dangerous form because they execute at
+## script-load; a top-level typed Dictionary/Array storage change can fail
+## before `_enter_tree` runs.
+##
+## The mitigation is two-part:
+##   (1) Field declarations are untyped (this block).
+##   (2) Construction and static access use local names declared at the top
+##       of the file (e.g. `Connection`, `Dispatcher`, `LogBuffer`,
+##       `ClientConfigurator`, `WindowsPortReservation`, ...), which keeps
+##       this entry script's load surface explicit and reviewable.
+##
+## Constructors, constants, and static methods on `Mcp*` classes are not the
+## self-update safety metric. The installer swaps one exact, re-hashed tree
+## before the resource scan, so the root never observes an extracted-over-live
+## mixture. In short: preload aliases are not the self-update safety metric.
+##
+var _connection
+var _dispatcher
+var _telemetry
+var _log_buffer
+var _game_log_buffer
+var _editor_log_buffer
+var _surfaced_error_tracker
+var _editor_logger: Logger
+var _dock
+var _debugger_plugin
+var _vision_routing
+var _export_plugin
+var _custom_tool_registry
+var _custom_tool_service_locator
+## Plugin-lifetime owners. The Dock only emits intents and receives copied
+## snapshots/outcomes, so replacing the view cannot abandon a live Thread or
+## a self-update.
+var _client_jobs
+var _update_manager
+## Process identity continuity and the immutable terminal outcome cross only
+## as values. The coordinator retains neither this plugin nor its objects.
+var _post_update_outcome: Dictionary = {}
+## The version an update just replaced. An AI client attached through the
+## update may spawn a backend of that version into the restart window; the
+## restarted editor replaces it once instead of asking the user to.
+var _post_update_replaced_version := ""
+## Clients the post-update migration left unchanged (`{id, reason}`), named
+## in the dock's completion banner so the user knows to click Configure.
+## Untyped on purpose: a typed collection field is the hot-reload crash
+## class (#245) the self-update smoke injects to prove the swap survives it.
+var _post_update_deferred := []
+var _last_logged_block := ""
+## Bounded re-probes while that backend is still binding its port: a port
+## that is bound but not yet answering status reads as merely occupied.
+const POST_UPDATE_REPROBE_LIMIT := 10
+var _post_update_reprobes_left := POST_UPDATE_REPROBE_LIMIT
+var _post_update_retry_episode := 0
+## A pre-v4 server left on the port by a still-running v3 attach bridge
+## outlives the fast budget above: its lease lasts 30 s after that client
+## quits and its idle backstop another 120 s. Poll slowly across that
+## window so the editor comes up green once the user has relaunched the
+## client, without any replacement authority over a server we cannot
+## authenticate.
+const POST_UPDATE_STALE_REPROBE_SECONDS := 10.0
+const POST_UPDATE_STALE_REPROBE_LIMIT := 21
+var _post_update_stale_reprobes_left := POST_UPDATE_STALE_REPROBE_LIMIT
+## An old bridge spawns again as soon as the port frees, so one replacement
+## may not be the last; a few are allowed before the dock takes over.
+const POST_UPDATE_REPLACEMENT_LIMIT := 3
+var _post_update_replacements_left := POST_UPDATE_REPLACEMENT_LIMIT
+## Set once the live tree has been renamed; the lock then belongs to the restart.
+var _update_swapped := false
+var _post_update_action := ""
+var _normal_start_released := false
+var _update_barrier_blocked := false
+## Serialized lifecycle episode owner. Construction is inert; `_enter_tree`
+## supplies a copied plan and starts it only after composition completes.
+var _lifecycle
+static var _resolved_ws_port := ClientConfigurator.DEFAULT_WS_PORT
+var _endpoint_policy: Dictionary = {}
+var _headless_disabled := false
+var _startup_trace_enabled := false
+var _startup_trace_start_ms := 0
+var _startup_trace_last_ms := 0
+var _startup_trace_counters: Dictionary = {}
+## Startup-path probes can now run on a worker thread (#678); the trace
+## counters they bump are shared with the main thread, so serialize.
+var _startup_trace_mutex := Mutex.new()
+var _startup_trace_netsh_start_count := 0
+var _unsupported_engine := false
+var _loaded_plugin_version := ""
+
+
+func _init() -> void:
+	_unsupported_engine = not _supports_godot_version(Engine.get_version_info())
+	if _unsupported_engine:
+		return
+	_lifecycle = ServerLifecycleManager.new()
+
+
+func _enter_tree() -> void:
+	if _unsupported_engine:
+		push_error(UNSUPPORTED_GODOT_MESSAGE + _pending_swap_hint())
+		return
+	_startup_trace_begin()
+
+	## Keep main-thread result polling off until the vision worker owner exists.
+	## Unsupported/headless/barrier-blocked startup therefore has no process
+	## callback and constructs no worker-capable object.
+	set_process(false)
+
+	_loaded_plugin_version = get_plugin_version()
+	## An installed tree that was just swapped in by the updater (or by the
+	## v3 migration capsule) proves itself before anything else is built: the
+	## live tree must hash to exactly what the signed manifest promised. A
+	## mismatch restores the retained backup; a missing backup keeps the plugin
+	## inactive with the exact paths. Dev checkouts never self-update.
+	if not ClientConfigurator.is_dev_checkout():
+		var was_swapped := str(UpdateInstaller.read_pending().get("status", "")) == "swapped"
+		var outcome: Dictionary = UpdateInstaller.verify_after_restart(LIVE_ADDON_ROOT)
+		if was_swapped and not outcome.is_empty():
+			_warn_if_verified_elsewhere(outcome)
+		if not outcome.is_empty():
+			_post_update_outcome = outcome.duplicate(true)
+			_post_update_outcome["outcome"] = str(outcome.get("status", ""))
+			var status := str(outcome.get("status", ""))
+			if status == "repair_required":
+				_block_update_startup(str(outcome.get("error", "")))
+				return
+			if status == "rolled_back" and was_swapped:
+				## The backup was just restored on disk while this process still
+				## runs the rejected tree. Restart into the restored tree; the next
+				## start presents the failure from the marker.
+				push_error("MCP | update to %s failed and the previous version was restored: %s" % [
+					str(outcome.get("to_version", "")), str(outcome.get("error", ""))
+				])
+				UpdateInstaller.persist_next_start_enabled(PLUGIN_CFG)
+				UpdateInstaller.request_restart.call_deferred()
+				return
+
+	_continue_enter_tree_after_update_barrier()
+
+
+## An update swapped in under one Godot and restarted into another (seen on
+## macOS, where the relaunch goes through LaunchServices by bundle). Say which
+## editor is waiting to verify it instead of refusing blindly.
+static func _pending_swap_hint() -> String:
+	var pending := UpdateInstaller.read_pending()
+	if str(pending.get("status", "")) != "swapped":
+		return ""
+	return (
+		" An update to %s was swapped in under Godot %s and is waiting to be verified;"
+		+ " reopen the project in that Godot."
+	) % [str(pending.get("to_version", "")), str(pending.get("godot_version", "unknown"))]
+
+
+static func _warn_if_verified_elsewhere(outcome: Dictionary) -> void:
+	var swapped_in := str(outcome.get("godot_version", ""))
+	var running := str(Engine.get_version_info().get("string", ""))
+	if swapped_in.is_empty() or swapped_in == running:
+		return
+	push_warning(
+		"MCP | update to %s was swapped in under Godot %s; this editor is Godot %s"
+		% [str(outcome.get("to_version", "")), swapped_in, running]
+	)
+
+
+func _continue_enter_tree_after_update_barrier() -> void:
+
+	## Register only after the update barrier, but before the headless guard:
+	## `godot --headless --export-*` still needs to strip the game-helper
+	## autoload from exported packs. The export plugin is otherwise inert.
+	_export_plugin = ExportPlugin.new()
+	add_export_plugin(_export_plugin)
+
+	if _mcp_disabled_for_headless_launch():
+		_headless_disabled = true
+		print("MCP | plugin disabled in headless mode")
+		return
+
+	## Register port overrides before spawn so `http_port()` / `ws_port()`
+	## return the user's configured values (if any) when `_start_server`
+	## builds the CLI args.
+	ClientConfigurator.ensure_settings_registered()
+	_startup_trace_phase("settings_registered")
+
+	_log_buffer = LogBuffer.new()
+	## Apply the persisted dock "Log" toggle before anything logs through the
+	## buffer. Without this the choice only took effect after a manual toggle
+	## and reset to noisy on every editor restart (#626).
+	_log_buffer.enabled = McpSettings.mcp_logging_enabled()
+
+	## Capture desired endpoint settings without probing the OS. WS reservation
+	## is an activation effect on Windows (`netsh`), so it runs only after every
+	## owner and the Dock have been constructed and wired below.
+	_endpoint_policy = ClientConfigurator.capture_endpoint_policy()
+	_resolved_ws_port = int(_endpoint_policy.ws_port)
+
+	## Construct plugin-lifetime work owners before attaching the replaceable
+	## Dock. Constructors are inert; activate() is the single normal-start seam
+	## that Phase 6's durable activation barrier will guard.
+	_client_jobs = ClientJobOwner.new()
+	_client_jobs.snapshot_changed.connect(_on_client_work_snapshot_changed)
+	_client_jobs.status_refresh_completed.connect(_on_client_status_refresh_completed)
+	_client_jobs.mcp_status_completed.connect(_on_mcp_client_status_completed)
+	_client_jobs.mcp_action_completed.connect(_on_mcp_client_action_completed)
+	_client_jobs.post_update_repin_completed.connect(_on_post_update_repin_completed)
+	_client_jobs.action_completed.connect(_on_client_action_completed)
+	_client_jobs.action_timed_out.connect(_on_client_action_timed_out)
+	add_child(_client_jobs)
+	_update_manager = UpdateManager.new()
+	_update_manager.update_check_completed.connect(_on_update_check_completed)
+	_update_manager.install_state_changed.connect(_on_update_install_state_changed)
+	_update_manager.activation_requested.connect(_on_update_activation_requested)
+	add_child(_update_manager)
+
+	_lifecycle.snapshot_changed.connect(_on_lifecycle_snapshot_changed)
+	_lifecycle.transport_ready.connect(_on_lifecycle_transport_ready)
+	_lifecycle.transport_cleared.connect(_on_lifecycle_transport_cleared)
+	_lifecycle.startup_finished.connect(_startup_trace_finish)
+
+	_game_log_buffer = GameLogBuffer.new()
+	_editor_log_buffer = EditorLogBuffer.new()
+	_surfaced_error_tracker = SurfacedErrorTracker.new(_editor_log_buffer, _game_log_buffer)
+	_attach_editor_logger()
+	_dispatcher = Dispatcher.new(_log_buffer, _surfaced_error_tracker)
+	_dispatcher.mcp_logging = _log_buffer.enabled
+	_startup_trace_phase("core_objects")
+
+	_connection = Connection.new()
+	_connection.log_buffer = _log_buffer
+	_connection.surfaced_error_tracker = _surfaced_error_tracker
+	_connection.ws_port = _resolved_ws_port
+	_connection.auth_token = ""
+	## Pause-depth restore boundary (#712): the dispatcher rebalances any
+	## pause_processing level a crashed handler leaked.
+	_dispatcher.pause_target = _connection
+	_connection.connect_blocked = _lifecycle.is_connection_blocked()
+	_connection.connect_block_reason = _lifecycle.get_status_dict().get("message", "")
+	## Replay the custom-tool catalog on (re)connect so tools registered
+	## before the initial connection or during a disconnect window reach
+	## the server — send_event silently drops while _connected is false.
+	_connection.connection_state_changed.connect(_on_connection_state_changed)
+
+	_telemetry = Telemetry.new(_connection)
+
+	_debugger_plugin = DebuggerPlugin.new(_log_buffer, _game_log_buffer, _editor_log_buffer, _surfaced_error_tracker)
+	_vision_routing = VisionRoutingScript.new()
+	_vision_routing.log_buffer = _log_buffer
+	set_process(true)
+	_debugger_plugin.vision_routing = _vision_routing
+	add_debugger_plugin(_debugger_plugin)
+	_connection.debugger_plugin = _debugger_plugin
+	_ensure_game_helper_autoload()
+
+	## Lazy handler registration (#736): declare each handler's script path
+	## and constructor args, then map every command to (handler_key, method).
+	## The dispatcher load()s + constructs a handler at the first dispatch of
+	## one of its commands and caches the instance, so this block is the
+	## authoritative command list without pulling any handler script into the
+	## boot-time compile closure. Constructor args are captured now (they are
+	## all plugin-lifetime objects) and released by _dispatcher.clear() in
+	## _exit_tree.
+	var undo := get_undo_redo()
+	_dispatcher.register_lazy_handler("editor", HANDLERS_DIR + "editor_handler.gd", [_log_buffer, _connection, _debugger_plugin, _game_log_buffer, _editor_log_buffer, null, _surfaced_error_tracker, _vision_routing])
+	_dispatcher.register_lazy_handler("scene", HANDLERS_DIR + "scene_handler.gd", [_connection])
+	_dispatcher.register_lazy_handler("node", HANDLERS_DIR + "node_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("project", HANDLERS_DIR + "project_handler.gd", [_connection, _debugger_plugin, _editor_log_buffer])
+	_dispatcher.register_lazy_handler(
+		"client",
+		HANDLERS_DIR + "client_handler.gd",
+		[_client_jobs],
+	)
+	_dispatcher.register_lazy_handler("script", HANDLERS_DIR + "script_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("resource", HANDLERS_DIR + "resource_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("api", HANDLERS_DIR + "api_handler.gd", [])
+	_dispatcher.register_lazy_handler("filesystem", HANDLERS_DIR + "filesystem_handler.gd", [_connection])
+	_dispatcher.register_lazy_handler("signal", HANDLERS_DIR + "signal_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("autoload", HANDLERS_DIR + "autoload_handler.gd", [])
+	_dispatcher.register_lazy_handler("input", HANDLERS_DIR + "input_handler.gd", [])
+	_dispatcher.register_lazy_handler("test", HANDLERS_DIR + "test_handler.gd", [undo, _log_buffer, _dispatcher, _connection])
+	_dispatcher.register_lazy_handler("batch", HANDLERS_DIR + "batch_handler.gd", [_dispatcher, undo])
+	_dispatcher.register_lazy_handler("ui", HANDLERS_DIR + "ui_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("theme", HANDLERS_DIR + "theme_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("animation", HANDLERS_DIR + "animation_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("material", HANDLERS_DIR + "material_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("shader", HANDLERS_DIR + "shader_handler.gd", [])
+	_dispatcher.register_lazy_handler("visual_shader", HANDLERS_DIR + "visual_shader_handler.gd", [])
+	_dispatcher.register_lazy_handler("particle", HANDLERS_DIR + "particle_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("camera", HANDLERS_DIR + "camera_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("audio", HANDLERS_DIR + "audio_handler.gd", [undo])
+	_dispatcher.register_lazy_handler(
+		"physics_shape", HANDLERS_DIR + "physics_shape_handler.gd", [undo, _connection]
+	)
+	_dispatcher.register_lazy_handler("environment", HANDLERS_DIR + "environment_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("texture", HANDLERS_DIR + "texture_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("curve", HANDLERS_DIR + "curve_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("control_draw_recipe", HANDLERS_DIR + "control_draw_recipe_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("tilemap", HANDLERS_DIR + "tilemap_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("tileset", HANDLERS_DIR + "tileset_handler.gd", [])
+	_dispatcher.register_lazy_handler("gridmap", HANDLERS_DIR + "gridmap_handler.gd", [undo])
+	_dispatcher.register_lazy_handler("navigation", HANDLERS_DIR + "navigation_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("csg", HANDLERS_DIR + "csg_handler.gd", [undo])
+
+	_dispatcher.register_lazy("get_editor_state", "editor", &"get_editor_state")
+	_dispatcher.register_lazy("get_scene_tree", "scene", &"get_scene_tree")
+	_dispatcher.register_lazy("get_open_scenes", "scene", &"get_open_scenes")
+	_dispatcher.register_lazy("find_nodes", "scene", &"find_nodes")
+	_dispatcher.register_lazy("create_scene", "scene", &"create_scene")
+	_dispatcher.register_lazy("open_scene", "scene", &"open_scene")
+	_dispatcher.register_lazy("save_scene", "scene", &"save_scene")
+	_dispatcher.register_lazy("save_scene_as", "scene", &"save_scene_as")
+	_dispatcher.register_lazy("get_selection", "editor", &"get_selection")
+	_dispatcher.register_lazy("create_node", "node", &"create_node")
+	_dispatcher.register_lazy("delete_node", "node", &"delete_node")
+	_dispatcher.register_lazy("reparent_node", "node", &"reparent_node")
+	_dispatcher.register_lazy("set_property", "node", &"set_property")
+	_dispatcher.register_lazy("rename_node", "node", &"rename_node")
+	_dispatcher.register_lazy("duplicate_node", "node", &"duplicate_node")
+	_dispatcher.register_lazy("move_node", "node", &"move_node")
+	_dispatcher.register_lazy("add_to_group", "node", &"add_to_group")
+	_dispatcher.register_lazy("remove_from_group", "node", &"remove_from_group")
+	_dispatcher.register_lazy("set_selection", "node", &"set_selection")
+	_dispatcher.register_lazy("get_node_properties", "node", &"get_node_properties")
+	_dispatcher.register_lazy("get_children", "node", &"get_children")
+	_dispatcher.register_lazy("get_groups", "node", &"get_groups")
+	_dispatcher.register_lazy("get_logs", "editor", &"get_logs")
+	_dispatcher.register_lazy("clear_logs", "editor", &"clear_logs")
+	_dispatcher.register_lazy("take_screenshot", "editor", &"take_screenshot")
+	_dispatcher.register_lazy("get_performance_monitors", "editor", &"get_performance_monitors")
+	_dispatcher.register_lazy("reload_plugin", "editor", &"reload_plugin")
+	_dispatcher.register_lazy("quit_editor", "editor", &"quit_editor")
+	_dispatcher.register_lazy("game_eval", "editor", &"game_eval")
+	_dispatcher.register_lazy("game_command", "editor", &"game_command")
+	_dispatcher.register_lazy("game_debug_control", "editor", &"game_debug_control")
+	_dispatcher.register_lazy("get_project_setting", "project", &"get_project_setting")
+	_dispatcher.register_lazy("set_project_setting", "project", &"set_project_setting")
+	_dispatcher.register_lazy("set_main_scene", "project", &"set_main_scene")
+	_dispatcher.register_lazy("run_project", "project", &"run_project")
+	_dispatcher.register_lazy("stop_project", "project", &"stop_project")
+	_dispatcher.register_lazy("search_filesystem", "project", &"search_filesystem")
+	_dispatcher.register_lazy("configure_client", "client", &"configure_client")
+	_dispatcher.register_lazy("remove_client", "client", &"remove_client")
+	_dispatcher.register_lazy("check_client_status", "client", &"check_client_status")
+	_dispatcher.register_lazy("create_script", "script", &"create_script")
+	_dispatcher.register_lazy("patch_script", "script", &"patch_script")
+	_dispatcher.register_lazy("read_script", "script", &"read_script")
+	_dispatcher.register_lazy("attach_script", "script", &"attach_script")
+	_dispatcher.register_lazy("detach_script", "script", &"detach_script")
+	_dispatcher.register_lazy("find_symbols", "script", &"find_symbols")
+	_dispatcher.register_lazy("search_resources", "resource", &"search_resources")
+	_dispatcher.register_lazy("load_resource", "resource", &"load_resource")
+	_dispatcher.register_lazy("inspect_resource", "resource", &"inspect_resource")
+	_dispatcher.register_lazy("assign_resource", "resource", &"assign_resource")
+	_dispatcher.register_lazy("create_resource", "resource", &"create_resource")
+	_dispatcher.register_lazy("get_resource_info", "resource", &"get_resource_info")
+	_dispatcher.register_lazy("get_class_info", "api", &"get_class_info")
+	_dispatcher.register_lazy("read_file", "filesystem", &"read_file")
+	_dispatcher.register_lazy("write_file", "filesystem", &"write_file")
+	_dispatcher.register_lazy("reimport", "filesystem", &"reimport")
+	_dispatcher.register_lazy("scan_filesystem", "filesystem", &"scan_filesystem")
+	_dispatcher.register_lazy("move_file", "filesystem", &"move_file")
+	_dispatcher.register_lazy("rename_file", "filesystem", &"rename_file")
+	_dispatcher.register_lazy("remove_file", "filesystem", &"remove_file")
+	_dispatcher.register_lazy("list_signals", "signal", &"list_signals")
+	_dispatcher.register_lazy("connect_signal", "signal", &"connect_signal")
+	_dispatcher.register_lazy("disconnect_signal", "signal", &"disconnect_signal")
+	_dispatcher.register_lazy("list_autoloads", "autoload", &"list_autoloads")
+	_dispatcher.register_lazy("add_autoload", "autoload", &"add_autoload")
+	_dispatcher.register_lazy("remove_autoload", "autoload", &"remove_autoload")
+	_dispatcher.register_lazy("list_actions", "input", &"list_actions")
+	_dispatcher.register_lazy("add_action", "input", &"add_action")
+	_dispatcher.register_lazy("ensure_action", "input", &"ensure_action")
+	_dispatcher.register_lazy("remove_action", "input", &"remove_action")
+	_dispatcher.register_lazy("bind_event", "input", &"bind_event")
+	_dispatcher.register_lazy("ensure_binding", "input", &"ensure_binding")
+	_dispatcher.register_lazy("run_tests", "test", &"run_tests")
+	_dispatcher.register_lazy("get_test_results", "test", &"get_test_results")
+	_dispatcher.register_lazy("batch_execute", "batch", &"batch_execute")
+	_dispatcher.register_lazy("set_anchor_preset", "ui", &"set_anchor_preset")
+	_dispatcher.register_lazy("set_text", "ui", &"set_text")
+	_dispatcher.register_lazy("set_richtext", "ui", &"set_richtext")
+	_dispatcher.register_lazy("build_layout", "ui", &"build_layout")
+	_dispatcher.register_lazy("create_theme", "theme", &"create_theme")
+	_dispatcher.register_lazy("theme_set_color", "theme", &"set_color")
+	_dispatcher.register_lazy("theme_set_constant", "theme", &"set_constant")
+	_dispatcher.register_lazy("theme_set_font_size", "theme", &"set_font_size")
+	_dispatcher.register_lazy("theme_set_stylebox_flat", "theme", &"set_stylebox_flat")
+	_dispatcher.register_lazy("theme_set_stylebox_texture", "theme", &"set_stylebox_texture")
+	_dispatcher.register_lazy("theme_set_font", "theme", &"set_font")
+	_dispatcher.register_lazy("theme_set_icon", "theme", &"set_icon")
+	_dispatcher.register_lazy("theme_stylebox_override", "theme", &"stylebox_override")
+	_dispatcher.register_lazy("apply_theme", "theme", &"apply_theme")
+	_dispatcher.register_lazy("animation_player_create", "animation", &"create_player")
+	_dispatcher.register_lazy("animation_create", "animation", &"create_animation")
+	_dispatcher.register_lazy("animation_add_property_track", "animation", &"add_property_track")
+	_dispatcher.register_lazy("animation_add_method_track", "animation", &"add_method_track")
+	_dispatcher.register_lazy("animation_set_autoplay", "animation", &"set_autoplay")
+	_dispatcher.register_lazy("animation_play", "animation", &"play")
+	_dispatcher.register_lazy("animation_stop", "animation", &"stop")
+	_dispatcher.register_lazy("animation_list", "animation", &"list_animations")
+	_dispatcher.register_lazy("animation_get", "animation", &"get_animation")
+	_dispatcher.register_lazy("animation_create_simple", "animation", &"create_simple")
+	_dispatcher.register_lazy("animation_delete", "animation", &"delete_animation")
+	_dispatcher.register_lazy("animation_validate", "animation", &"validate_animation")
+	_dispatcher.register_lazy("animation_preset_fade", "animation", &"preset_fade")
+	_dispatcher.register_lazy("animation_preset_slide", "animation", &"preset_slide")
+	_dispatcher.register_lazy("animation_preset_shake", "animation", &"preset_shake")
+	_dispatcher.register_lazy("animation_preset_pulse", "animation", &"preset_pulse")
+	_dispatcher.register_lazy("material_create", "material", &"create_material")
+	_dispatcher.register_lazy("visual_shader_create_graph", "visual_shader", &"create_graph")
+	_dispatcher.register_lazy("visual_shader_get", "visual_shader", &"get_graph")
+	_dispatcher.register_lazy("visual_shader_node_catalog", "visual_shader", &"node_catalog")
+	_dispatcher.register_lazy("visual_shader_edit", "visual_shader", &"edit_graph")
+	_dispatcher.register_lazy("material_set_param", "material", &"set_param")
+	_dispatcher.register_lazy("material_set_shader_param", "material", &"set_shader_param")
+	_dispatcher.register_lazy("material_get", "material", &"get_material")
+	_dispatcher.register_lazy("material_list", "material", &"list_materials")
+	_dispatcher.register_lazy("material_assign", "material", &"assign_material")
+	_dispatcher.register_lazy("material_apply_to_node", "material", &"apply_to_node")
+	_dispatcher.register_lazy("material_apply_preset", "material", &"apply_preset")
+	_dispatcher.register_lazy("shader_create", "shader", &"create_shader")
+	_dispatcher.register_lazy("shader_get", "shader", &"get_shader")
+	_dispatcher.register_lazy("shader_validate", "shader", &"validate_shader")
+	_dispatcher.register_lazy("shader_patch", "shader", &"patch_shader")
+	_dispatcher.register_lazy("particle_create", "particle", &"create_particle")
+	_dispatcher.register_lazy("particle_set_main", "particle", &"set_main")
+	_dispatcher.register_lazy("particle_set_process", "particle", &"set_process")
+	_dispatcher.register_lazy("particle_set_draw_pass", "particle", &"set_draw_pass")
+	_dispatcher.register_lazy("particle_restart", "particle", &"restart_particle")
+	_dispatcher.register_lazy("particle_get", "particle", &"get_particle")
+	_dispatcher.register_lazy("particle_apply_preset", "particle", &"apply_preset")
+	_dispatcher.register_lazy("camera_create", "camera", &"create_camera")
+	_dispatcher.register_lazy("camera_configure", "camera", &"configure")
+	_dispatcher.register_lazy("camera_set_limits_2d", "camera", &"set_limits_2d")
+	_dispatcher.register_lazy("camera_set_damping_2d", "camera", &"set_damping_2d")
+	_dispatcher.register_lazy("camera_follow_2d", "camera", &"follow_2d")
+	_dispatcher.register_lazy("camera_get", "camera", &"get_camera")
+	_dispatcher.register_lazy("camera_list", "camera", &"list_cameras")
+	_dispatcher.register_lazy("camera_apply_preset", "camera", &"apply_preset")
+	_dispatcher.register_lazy("audio_player_create", "audio", &"create_player")
+	_dispatcher.register_lazy("audio_player_set_stream", "audio", &"set_stream")
+	_dispatcher.register_lazy("audio_player_set_playback", "audio", &"set_playback")
+	_dispatcher.register_lazy("audio_play", "audio", &"play")
+	_dispatcher.register_lazy("audio_stop", "audio", &"stop")
+	_dispatcher.register_lazy("audio_list", "audio", &"list_streams")
+	_dispatcher.register_lazy("physics_shape_autofit", "physics_shape", &"autofit")
+	_dispatcher.register_lazy("physics_shape_generate", "physics_shape", &"generate")
+	_dispatcher.register_lazy("environment_create", "environment", &"create_environment")
+	_dispatcher.register_lazy("gradient_texture_create", "texture", &"create_gradient_texture")
+	_dispatcher.register_lazy("noise_texture_create", "texture", &"create_noise_texture")
+	_dispatcher.register_lazy("curve_set_points", "curve", &"set_points")
+	_dispatcher.register_lazy("control_draw_recipe", "control_draw_recipe", &"control_draw_recipe")
+	_dispatcher.register_lazy("tilemap_set_cell", "tilemap", &"set_cell")
+	_dispatcher.register_lazy("tilemap_set_cells_rect", "tilemap", &"set_cells_rect")
+	_dispatcher.register_lazy("tilemap_clear", "tilemap", &"clear_layer")
+	_dispatcher.register_lazy("tilemap_get_cells", "tilemap", &"get_used_cells")
+	_dispatcher.register_lazy("tileset_get_atlas_tiles", "tileset", &"get_atlas_tiles")
+	_dispatcher.register_lazy("tileset_get_atlas_image", "tileset", &"get_atlas_image")
+	_dispatcher.register_lazy("gridmap_set_item", "gridmap", &"set_item")
+	_dispatcher.register_lazy("gridmap_fill", "gridmap", &"fill")
+	_dispatcher.register_lazy("gridmap_clear", "gridmap", &"clear_layer")
+	_dispatcher.register_lazy("gridmap_get_used_cells", "gridmap", &"get_used_cells")
+	_dispatcher.register_lazy("gridmap_list_library_items", "gridmap", &"list_library_items")
+	_dispatcher.register_lazy("navigation_bake", "navigation", &"bake")
+	_dispatcher.register_lazy("navigation_path_get", "navigation", &"path_get")
+	_dispatcher.register_lazy("csg_create", "csg", &"create")
+	_dispatcher.register_lazy("csg_set_operation", "csg", &"set_operation")
+
+	_connection.dispatcher = _dispatcher
+	add_child(_connection)
+	_startup_trace_phase("handlers_registered")
+
+	# Custom tool registry
+	_custom_tool_service_locator = McpServiceLocator.new()
+	_custom_tool_service_locator.setup(_connection, _log_buffer)
+	_custom_tool_registry = McpToolRegistry.new()
+	_custom_tool_registry.setup(_dispatcher, _custom_tool_service_locator)
+	_custom_tool_registry.tools_changed.connect(_on_custom_tools_changed)
+	_custom_tool_registry.mark_ready()
+	_startup_trace_phase("custom_tools_ready")
+
+	# Dock panel
+	_dock = Dock.new()
+	_dock.vision_routing = _vision_routing
+	_dock.name = "Godot AI"
+	_dock.update_requested.connect(_on_dock_update_requested)
+	_dock.client_action_requested.connect(_on_dock_client_action_requested)
+	_dock.client_action_cancel_requested.connect(_on_dock_client_action_cancel_requested)
+	_dock.client_status_refresh_requested.connect(_on_dock_client_status_refresh_requested)
+	_dock.status_snapshot_requested.connect(_on_dock_status_snapshot_requested)
+	_dock.live_server_probe_requested.connect(_on_dock_live_server_probe_requested)
+	_dock.lifecycle_action_requested.connect(_on_dock_lifecycle_action_requested)
+	_dock.dev_server_action_requested.connect(_on_dock_dev_server_action_requested)
+	_dock.mcp_logging_changed.connect(_on_dock_mcp_logging_changed)
+	_dock.log_snapshot_requested.connect(_on_dock_log_snapshot_requested)
+	_dock.plugin_reload_requested.connect(_on_dock_plugin_reload_requested)
+	_dock.settings_apply_requested.connect(_on_dock_settings_apply_requested)
+	_dock.post_update_action_requested.connect(_on_dock_post_update_action_requested)
+	_client_jobs.set_client_health_blocked(_client_health_is_blocked())
+	_publish_dock_status_snapshots()
+	add_control_to_dock(DOCK_SLOT_RIGHT_BL, _dock)
+	_dock.present_client_work_snapshot(_client_jobs.snapshot())
+	_startup_trace_phase("dock_attached")
+	## Activation barrier: no process, socket, or probe effect begins until all
+	## owners and the replaceable Dock have been constructed and wired.
+	_activate_startup_endpoints()
+
+
+## Endpoint selection is retryable before the immutable launch policy or any
+## client migration worker exists. An old bridge keeps its own ports.
+func _activate_startup_endpoints() -> void:
+	if str(_post_update_outcome.get("outcome", "")) == "success":
+		var prepare_started := _startup_trace_call_begin("prepare_upgrade_endpoints")
+		var prepared := ClientConfigurator.prepare_major_upgrade_endpoints(
+			str(_post_update_outcome.get("from_version", "")),
+			str(_post_update_outcome.get("to_version", "")),
+		)
+		_startup_trace_call_end("prepare_upgrade_endpoints", prepare_started)
+		if not bool(prepared.get("ok", false)):
+			_present_endpoint_setup_failure(str(prepared.get("error", "Endpoint selection failed.")))
+			return
+	var override_started := _startup_trace_call_begin("endpoint_override")
+	var override := ClientConfigurator.v4_endpoint_ports_status()
+	_startup_trace_call_end("endpoint_override", override_started)
+	if not bool(override.get("ok", false)):
+		_present_endpoint_setup_failure(str(override.get("error", "Invalid endpoint override.")))
+		return
+	var policy_started := _startup_trace_call_begin("endpoint_policy")
+	var resolved_policy := ClientConfigurator.capture_endpoint_policy()
+	_startup_trace_call_end("endpoint_policy", policy_started)
+	var http_port := int(resolved_policy.http_port)
+	var configured_ws := int(resolved_policy.ws_port)
+	if (
+		http_port < ClientConfigurator.MIN_PORT or http_port > ClientConfigurator.MAX_PORT
+		or configured_ws < ClientConfigurator.MIN_PORT or configured_ws > ClientConfigurator.MAX_PORT
+		or http_port == configured_ws
+	):
+		_present_endpoint_setup_failure("Choose distinct HTTP and WebSocket ports between %d and %d in Godot AI settings." % [ClientConfigurator.MIN_PORT, ClientConfigurator.MAX_PORT])
+		return
+	var ws_started := _startup_trace_call_begin("resolve_ws_port")
+	var resolved_ws := _resolve_ws_port(configured_ws)
+	_startup_trace_call_end("resolve_ws_port", ws_started)
+	if (
+		resolved_ws < ClientConfigurator.MIN_PORT or resolved_ws > ClientConfigurator.MAX_PORT
+		or resolved_ws == http_port
+		or (bool(override.present) and resolved_ws != configured_ws)
+	):
+		_present_endpoint_setup_failure("The configured WebSocket port is unavailable. Choose another endpoint pair in Godot AI settings, then retry.")
+		return
+	resolved_policy["ws_port"] = resolved_ws
+	var capability_started := _startup_trace_call_begin("capability_path")
+	resolved_policy["capability_path"] = TransportCapability.path_for_http_port(http_port)
+	_startup_trace_call_end("capability_path", capability_started)
+	_set_endpoint_policy(resolved_policy)
+	if _connection != null:
+		_connection.ws_port = resolved_ws
+	if _post_update_action == "retry_endpoints":
+		_post_update_action = ""
+		if _dock != null:
+			_dock.present_update_state({"post_update_action": "", "status_text": "", "label_text": "", "banner_visible": false})
+	## #691: publish every environment/setting value before the first worker.
+	var warm_started := _startup_trace_call_begin("warm_env_snapshot")
+	ClientConfigurator.warm_env_snapshot(_endpoint_policy)
+	_startup_trace_call_end("warm_env_snapshot", warm_started)
+	var plan := _capture_lifecycle_plan()
+	var configure_started := _startup_trace_call_begin("lifecycle_configure")
+	_lifecycle.configure(plan)
+	_startup_trace_call_end("lifecycle_configure", configure_started)
+	var release_started := _startup_trace_call_begin("startup_release")
+	_begin_startup_release()
+	_startup_trace_call_end("startup_release", release_started)
+
+
+func _present_endpoint_setup_failure(error: String) -> void:
+	_post_update_action = "retry_endpoints"
+	_lifecycle._block_without_effect("endpoint_setup_failed", error)
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"button_text": "Retry endpoint setup",
+			"status_text": "Client endpoint setup failed",
+			"button_disabled": false,
+			"label_text": error,
+			"banner_visible": true,
+			"post_update_action": "retry_endpoints",
+		})
+
+
+func _client_health_is_blocked() -> bool:
+	return ServerStateScript.blocks_client_health(
+		int(_lifecycle.get_status_dict().get("state", ServerStateScript.UNINITIALIZED))
+	)
+
+
+func _on_dock_client_action_requested(client_id: String, action: String) -> void:
+	if _client_jobs == null:
+		return
+	if not _client_jobs.request_action(client_id, action) and _dock != null:
+		_dock.present_client_work_snapshot(_client_jobs.snapshot())
+
+
+func _on_dock_client_action_cancel_requested(client_id: String) -> void:
+	if _client_jobs == null:
+		return
+	_client_jobs.cancel_pending_action(client_id)
+	if _dock != null:
+		_dock.present_client_work_snapshot(_client_jobs.snapshot())
+
+
+func _on_dock_client_status_refresh_requested(client_ids: Array[String], force: bool) -> void:
+	if _client_jobs == null:
+		return
+	_client_jobs.set_client_health_blocked(_client_health_is_blocked())
+	_client_jobs.request_status_refresh(client_ids, force)
+
+
+func _on_client_work_snapshot_changed(snapshot: Dictionary) -> void:
+	if _dock != null:
+		_dock.present_client_work_snapshot(snapshot)
+
+
+func _on_client_status_refresh_completed(results: Dictionary) -> void:
+	if _dock != null:
+		_dock.present_client_status_refresh_results(results)
+
+
+func _on_mcp_client_status_completed(
+	request_ids: Array[String], payload: Dictionary
+) -> void:
+	if _connection == null:
+		return
+	for request_id in request_ids:
+		_connection.send_deferred_response(request_id, payload)
+
+
+func _on_mcp_client_action_completed(request_id: String, payload: Dictionary) -> void:
+	if _connection != null:
+		_connection.send_deferred_response(request_id, payload)
+
+
+func _on_client_action_completed(
+	client_id: String, action: String, result: Dictionary, prewarm: Dictionary
+) -> void:
+	if _dock != null:
+		_dock.present_client_action_result(client_id, action, result, prewarm)
+
+
+func _on_client_action_timed_out(client_id: String, action: String, detail: String) -> void:
+	if _dock != null:
+		_dock.present_client_action_timeout(client_id, action, detail)
+
+
+func _transport_snapshot_for_dock() -> Dictionary:
+	if _connection == null:
+		return {"connected": false, "server_version": "", "status": {}}
+	return {
+		"connected": _connection.is_connected,
+		"server_version": _connection.server_version,
+		"status": _connection.get_transport_status(),
+	}
+
+
+func _lifecycle_snapshot_for_dock() -> Dictionary:
+	if _lifecycle == null:
+		return {
+			"state": ServerStateScript.UNINITIALIZED,
+			"server_pid": -1,
+			"resolved_ws_port": _resolved_ws_port,
+			"can_restart_managed": false,
+			"can_recover_incompatible": false,
+			"normal_start_released": _normal_start_released,
+		}
+	var snapshot: Dictionary = _lifecycle.get_status_dict().duplicate(true)
+	snapshot["server_pid"] = _lifecycle.get_server_pid()
+	snapshot["resolved_ws_port"] = _resolved_ws_port
+	snapshot["can_restart_managed"] = (
+		_normal_start_released and _lifecycle.can_restart_managed_server()
+	)
+	snapshot["can_recover_incompatible"] = (
+		_normal_start_released and bool(snapshot.get("can_recover_incompatible", false))
+	)
+	snapshot["normal_start_released"] = _normal_start_released
+	if _post_update_retry_episode > 0 and int(snapshot.get("episode_id", 0)) == _post_update_retry_episode:
+		var episode: Dictionary = _lifecycle.episode_snapshot()
+		if str(episode.get("state", "")) == "BLOCKED" and str(episode.get("reason", "")) == "launch_gone" and str(episode.get("proof_pending_reason", "")) == "capability_pair":
+			## Only the presentation changes; transport remains blocked until proof.
+			snapshot["state"] = ServerStateScript.SPAWNING
+			snapshot["handoff_retry_pending"] = true
+	return snapshot
+
+
+func _publish_dock_status_snapshots() -> void:
+	if _dock == null:
+		return
+	_dock.present_transport_snapshot(_transport_snapshot_for_dock())
+	_dock.present_lifecycle_snapshot(_lifecycle_snapshot_for_dock())
+
+
+func _on_dock_status_snapshot_requested() -> void:
+	_publish_dock_status_snapshots()
+
+
+func _on_dock_live_server_probe_requested(port: int) -> void:
+	if _dock != null:
+		_dock.present_live_server_probe_result(
+			ServerLifecycleManager.probe_live_server_status(
+				port, ServerLifecycleManager.DEFAULT_PROBE_TIMEOUT_MS,
+				str(_endpoint_policy.get("capability_path", ""))
+			)
+		)
+
+
+func _on_dock_lifecycle_action_requested(action: int) -> void:
+	if not _normal_start_released:
+		if _dock != null:
+			_dock.present_lifecycle_action_result(false)
+		_publish_dock_status_snapshots()
+		return
+	var accepted := false
+	match action:
+		Dock.LifecycleAction.RECOVER_INCOMPATIBLE:
+			accepted = bool(await recover_incompatible_server())
+		Dock.LifecycleAction.RESTART_SERVER:
+			accepted = force_restart_server()
+	if _dock != null:
+		_dock.present_lifecycle_action_result(accepted)
+	_publish_dock_status_snapshots()
+
+
+func _on_dock_dev_server_action_requested(action: int) -> void:
+	if action != Dock.DevServerAction.STOP and not _normal_start_released:
+		_publish_dock_status_snapshots()
+		return
+	match action:
+		Dock.DevServerAction.START_OR_RESTART:
+			if _telemetry != null:
+				_telemetry.record_dev_server_toggle("start")
+			restart_or_start_managed_server()
+		Dock.DevServerAction.STOP:
+			if _telemetry != null:
+				_telemetry.record_dev_server_toggle("stop")
+			stop_managed_server()
+	_publish_dock_status_snapshots()
+
+
+func _on_dock_mcp_logging_changed(enabled: bool) -> void:
+	if _dispatcher != null:
+		_dispatcher.mcp_logging = enabled
+	if _log_buffer != null:
+		_log_buffer.enabled = enabled
+
+
+func _on_dock_log_snapshot_requested(after_sequence: int) -> void:
+	if _dock == null or _log_buffer == null:
+		return
+	var sequence: int = _log_buffer.total_logged()
+	var reset: bool = sequence < after_sequence
+	var count: int = sequence if reset else maxi(0, sequence - after_sequence)
+	_dock.present_log_snapshot({
+		"sequence": sequence,
+		"reset": reset,
+		"lines": _log_buffer.get_recent(count),
+	})
+
+
+func _on_dock_plugin_reload_requested(reason: String) -> void:
+	Telemetry.record_pending_plugin_reload(reason)
+	## The reload frees this plugin, so it must not run on one of this
+	## instance's own frames: defer the static call itself, never a method of
+	## this instance. A deferred method that reloads synchronously returns into
+	## a freed script and takes the editor down (SIGBUS/SIGABRT after
+	## "Bad address index").
+	PluginReload.reload_enabled_plugin.call_deferred()
+
+
+func _on_dock_settings_apply_requested(changes: Dictionary, reload: bool) -> void:
+	var applied := ClientConfigurator.apply_endpoint_settings(changes.duplicate(true))
+	if not bool(applied.get("ok", false)):
+		push_error("MCP | refused settings change: %s" % str(applied.get("error", "invalid settings")))
+		return
+	## #913: the setting is persisted, so push any opt-out to the live server —
+	## the reload below replaces this plugin, not a server it merely adopted.
+	## Best-effort: the reload may cut the socket first, and the reconnect
+	## re-asserts it from `Telemetry._on_connection_state_changed` anyway.
+	if _telemetry != null:
+		_telemetry.assert_opt_out()
+	if reload:
+		_on_dock_plugin_reload_requested("endpoint_settings")
+
+
+func _on_dock_update_requested() -> void:
+	if _update_manager != null and _update_manager.has_install_candidate():
+		_update_manager.start_install(_preflight_update())
+
+
+func _on_update_check_completed(result: Dictionary) -> void:
+	if _dock != null:
+		_dock.present_update_check(result)
+
+
+func _on_update_install_state_changed(state: Dictionary) -> void:
+	if not bool(state.get("install_in_flight", true)) and _client_jobs != null:
+		_client_jobs.resume_after_quiesce()
+	if not bool(state.get("install_in_flight", true)) and not _update_swapped:
+		UpdateInstaller.release_lock()
+	if _dock != null:
+		_dock.present_update_state(state)
+
+
+func _on_update_activation_requested(package: Dictionary) -> void:
+	install_downloaded_update(package)
+
+
+## Hold successful activation behind the client-migration barrier. Rollback
+## resumes normally after recording its terminal outcome.
+func _begin_startup_release() -> void:
+	if str(_post_update_outcome.get("outcome", "")) != "success":
+		if not _post_update_outcome.is_empty():
+			_present_post_update_failure()
+			UpdateInstaller.clear_pending()
+		_fan_post_update_outcome()
+		_release_normal_startup()
+		return
+	var started: Dictionary = _client_jobs.begin_post_update_repin(
+		str(_post_update_outcome.get("from_version", "")),
+		str(_post_update_outcome.get("to_version", "")),
+		bool(_post_update_outcome.get(
+			"replace_owned_mismatches",
+			_post_update_outcome.get("manual_migration", false),
+		)),
+	)
+	if not bool(started.get("ok", false)):
+		_present_post_update_barrier_failure(str(started.get("error", "Client migration could not start.")))
+		return
+	_post_update_action = ""
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": true,
+			"status_text": "Migrating client configuration…",
+			"button_disabled": true,
+			"label_text": "The server remains stopped until configured clients are repinned.",
+			"banner_visible": true,
+			"post_update_action": "",
+		})
+
+
+func _on_post_update_repin_completed(result: Dictionary) -> void:
+	if str(_post_update_outcome.get("outcome", "")) != "success":
+		return
+	if not bool(result.get("ok", false)):
+		_present_post_update_barrier_failure(str(result.get("error", "Client migration failed.")))
+		return
+	for client_id in result.get("foreign_ids", []):
+		push_warning(
+			"MCP | the %s entry named godot-ai launches something else; it was left unchanged. Use Configure in the dock to replace it."
+			% str(client_id)
+		)
+	_post_update_deferred = []
+	for entry in result.get("deferred", []):
+		if entry is Dictionary:
+			_post_update_deferred.append((entry as Dictionary).duplicate(true))
+			push_warning(
+				"MCP | %s was not migrated automatically because %s; it was left unchanged. Use Configure in the dock."
+				% [str(entry.get("id", "")), str(entry.get("reason", ""))]
+			)
+	## A click cannot prove that an external client restarted. The enforceable
+	## boundary is the one we own: repin its configuration, mark the update
+	## complete, then start and authenticate that server. A major upgrade can
+	## select independent ports; old clients must reload the migrated config,
+	## but cannot hold the new editor endpoint behind their existing leases.
+	_finish_post_update()
+
+
+func _present_post_update_barrier_failure(error: String) -> void:
+	_post_update_action = "retry"
+	push_error("MCP | post-update client migration blocked startup: %s" % error)
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"button_text": "Retry client migration",
+			"status_text": "Installed — client migration failed",
+			"button_disabled": false,
+			"label_text": "Server startup is blocked: %s" % error,
+			"banner_visible": true,
+			"post_update_action": "retry",
+		})
+
+
+func _on_dock_post_update_action_requested(action: String) -> void:
+	if action != _post_update_action:
+		return
+	if action == "retry_endpoints":
+		_activate_startup_endpoints()
+	elif action == "retry":
+		_begin_startup_release()
+
+
+func _finish_post_update() -> void:
+	print("MCP | client migration completed")
+	## The success marker stays as the durable record of the last update; the
+	## next swap overwrites it and preflight only refuses swapped/repair states.
+	## Recording the migration keeps later starts from repeating it.
+	var recorded := UpdateInstaller.record_clients_migrated()
+	if recorded != OK:
+		push_warning("MCP | could not record client migration in the update marker: %s" % error_string(recorded))
+	## In-editor updates retain old script graphs for undo. Keep their backing
+	## files until a fresh editor process can safely prune older generations.
+	if not get_tree().root.has_meta("godot_ai_retained_update_scripts"):
+		UpdateInstaller.prune_backups(str(_post_update_outcome.get("from_version", "")))
+	_post_update_replaced_version = str(_post_update_outcome.get("from_version", ""))
+	_post_update_reprobes_left = POST_UPDATE_REPROBE_LIMIT
+	_post_update_stale_reprobes_left = POST_UPDATE_STALE_REPROBE_LIMIT
+	_post_update_replacements_left = POST_UPDATE_REPLACEMENT_LIMIT
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	if McpServerVersionCheck.attached_bridges_follow(_post_update_replaced_version, to_version):
+		print("MCP | AI clients using v%s can reconnect to v%s; relaunch clients still using older versions" % [_post_update_replaced_version, to_version])
+	else:
+		print(
+			"MCP | Refresh the Godot AI MCP connection and reload its configuration once to use v%s; relaunch the AI app if it cannot reload the configuration"
+			% to_version
+		)
+	_present_post_update_complete()
+	_fan_post_update_outcome()
+	_release_normal_startup()
+
+
+func _present_post_update_failure() -> void:
+	var error := str(_post_update_outcome.get("error", ""))
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	push_error("MCP | update to %s failed; the previous version is live: %s" % [to_version, error])
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"status_text": "Update failed — previous version restored",
+			"button_disabled": false,
+			"label_text": error,
+			"banner_visible": true,
+			"post_update_action": "",
+		})
+
+
+func _present_post_update_complete() -> void:
+	_post_update_action = ""
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"status_text": "Godot AI installed" if _post_update_deferred.is_empty() else "Installed — client setup needed",
+			"button_disabled": true,
+			"label_text": _post_update_complete_label(),
+			"banner_visible": true,
+			"post_update_action": "",
+			"outcome": "success",
+		})
+
+
+func _post_update_complete_label() -> String:
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	var from_version := str(_post_update_outcome.get("from_version", ""))
+	var text := (
+		"AI clients already using v%s can reconnect to v%s without restarting. Refresh older MCP connections and reload their configuration; relaunch the AI app if needed." % [from_version, to_version]
+		if McpServerVersionCheck.attached_bridges_follow(from_version, to_version)
+		else "Refresh the Godot AI MCP connection and reload its configuration once to use v%s. If the AI app cannot reload its configuration, quit and relaunch it."
+		% to_version
+	)
+	if _post_update_deferred.is_empty():
+		return text
+	var named: Array[String] = []
+	for entry in _post_update_deferred:
+		var client_id := str(entry.get("id", ""))
+		var client := McpClientRegistry.get_by_id(client_id)
+		var name: String = client.display_name if client != null else client_id
+		named.append("%s (%s)" % [name, str(entry.get("reason", "not migrated"))])
+	return text + " Not migrated: %s. Use Configure to replace them." % ", ".join(named)
+
+
+## Sole release point for ordinary work and the server lifecycle. Keeping
+## these effects together makes the post-update legal ordering reviewable.
+func _release_normal_startup() -> void:
+	if _normal_start_released:
+		return
+	_normal_start_released = true
+	_client_jobs.set_client_health_blocked(_client_health_is_blocked())
+	_client_jobs.activate()
+	_update_manager.check_for_updates.call_deferred()
+	_start_server()
+	_startup_trace_phase("server_start")
+	_log_buffer.log("plugin loaded")
+	if _telemetry != null:
+		_telemetry.record_dock_startup()
+		_telemetry.flush_pending_plugin_reload()
+
+
+## Fan one immutable terminal update outcome. It is held only in this
+## instance's memory, never EditorSettings, and is cleared exactly once.
+func _fan_post_update_outcome() -> void:
+	if _post_update_outcome.is_empty():
+		return
+	var outcome := str(_post_update_outcome.get("outcome", ""))
+	var status := "unknown"
+	match outcome:
+		"success":
+			status = "success"
+		"rolled_back":
+			status = "failed_clean"
+		"repair_required", "quarantined":
+			status = "failed_mixed"
+	var error := "" if outcome == "success" else str(_post_update_outcome.get("error", outcome.replace("_", " ")))
+	var from_version := str(_post_update_outcome.get("from_version", ""))
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	if _telemetry != null and not bool(_post_update_outcome.get("manual_migration", false)):
+		_telemetry.record_self_update(status, from_version, to_version, error)
+	_post_update_outcome.clear()
+
+
+func _block_update_startup(reason: String) -> void:
+	_update_barrier_blocked = true
+	push_error("MCP | update recovery blocked plugin startup: %s" % reason)
+	_disable_after_update_barrier.call_deferred()
+
+
+func _disable_after_update_barrier() -> void:
+	## A live tree that neither matches its manifest nor has a backup to
+	## restore must not run. Disable the shell so nothing is built from it;
+	## the marker keeps the exact paths for manual recovery.
+	if _update_barrier_blocked:
+		print("MCP | disabling plugin after update barrier refusal")
+		EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
+
+
+func _exit_tree() -> void:
+	if _unsupported_engine:
+		return
+	set_process(false)
+	## Registered before the headless guard in _enter_tree, so it must be
+	## removed before the headless early-return here too.
+	if _export_plugin != null:
+		remove_export_plugin(_export_plugin)
+		_export_plugin = null
+
+	if _headless_disabled:
+		_headless_disabled = false
+		## Ported from upstream PR #936 at
+		## 537a490c865837bedb96042d10ee0fc74673cd99: `_lifecycle` is built in
+		## _init(), before the headless guard in _enter_tree() runs, so it exists
+		## even on this path — null it here too (full teardown below is skipped).
+		_lifecycle = null
+		return
+
+	if _update_barrier_blocked:
+		_update_barrier_blocked = false
+		_lifecycle = null
+		return
+
+	## Client work has plugin lifetime, independent of the Dock. Realize every
+	## thread before either owner script can be reloaded or freed.
+	if _client_jobs != null:
+		_client_jobs.quiesce()
+
+	if _custom_tool_registry != null:
+		_custom_tool_registry.clear()
+		_custom_tool_registry = null
+
+	_custom_tool_service_locator = null
+
+	## Outer-to-inner teardown. Dispatcher Callables hold RefCounted handlers
+	## alive past the point where Godot reloads their class_name scripts — the
+	## first post-reload call into a typed-array-holding handler (e.g.
+	## McpGameLogBuffer._storage) then SIGSEGVs against a stale class descriptor.
+	## See issue #46.
+
+	# Stop inbound work first so _process can't enqueue new commands or
+	# null-deref log_buffer on the next tick mid-teardown.
+	if _connection:
+		_connection.teardown()
+
+	if _vision_routing:
+		_vision_routing.shutdown()
+		_vision_routing = null
+	# Transport is stopped and both worker owners have joined. Release the
+	# ordinary plugin-lifetime graph; this is not the stronger hot script-swap
+	# authorization (prepare_for_update_reload still requires clear()).
+	if _dispatcher:
+		_dispatcher.release_after_teardown()
+
+	if _dock:
+		_dock.release_editor_progress_dialog()
+		remove_control_from_docks(_dock)
+		_dock.queue_free()
+		_dock = null
+	if _update_manager:
+		_update_manager.cancel_install()
+		_update_manager.queue_free()
+		_update_manager = null
+	if _client_jobs:
+		_client_jobs.queue_free()
+		_client_jobs = null
+	if _connection:
+		_connection.queue_free()
+		_connection = null
+	if _debugger_plugin:
+		remove_debugger_plugin(_debugger_plugin)
+		_debugger_plugin = null
+
+	## Detach the editor logger BEFORE nulling the buffer. After remove_logger
+	## returns, Godot guarantees no further virtual calls — so the logger's
+	## next access to `_buffer` (if any in flight) lands on a still-live
+	## ref-counted buffer, not a freed one.
+	_detach_editor_logger()
+
+	_dispatcher = null
+	_log_buffer = null
+	_game_log_buffer = null
+	_editor_log_buffer = null
+	_surfaced_error_tracker = null
+
+	## Teardown follows the immutable launch plan: keep-on-exit or an active
+	## lease detaches; otherwise the exact owned-process grant is stopped.
+	_lifecycle.teardown_for_editor_exit()
+	_lifecycle = null
+	print("MCP | plugin unloaded")
+
+
+func _process(_delta: float) -> void:
+	if _vision_routing != null:
+		_vision_routing.poll_completed()
+
+
+## Attach editor_logger.gd as a Godot logger so editor-process script
+## errors (parse errors, @tool runtime errors, EditorPlugin errors,
+## push_error/push_warning) flow into _editor_log_buffer for
+## logs_read(source="editor").
+##
+## Limitation called out in the issue: parse errors fired *before* the
+## plugin's _enter_tree (e.g. during the editor's initial filesystem
+## scan, or for scripts that fail on first project open) happen before
+## add_logger is called and are not captured. There's no public API to
+## drain the editor's already-emitted error history; rescanning the
+## file would re-emit them but at the cost of disrupting the user's
+## editing state, so we accept the gap.
+func _attach_editor_logger() -> void:
+	_editor_logger = EditorLogger.new(_editor_log_buffer)
+	OS.add_logger(_editor_logger)
+
+
+func _detach_editor_logger() -> void:
+	if _editor_logger != null:
+		OS.remove_logger(_editor_logger)
+	_editor_logger = null
+
+
+## Register the game-side autoload on plugin enable. Runs the helper inside
+## the game process so the editor-side debugger plugin can request
+## framebuffer captures over EngineDebugger messages. Removed on
+## _disable_plugin so disabling the plugin leaves project.godot clean.
+func _enable_plugin() -> void:
+	if _mcp_disabled_for_headless_launch():
+		return
+	_ensure_game_helper_autoload()
+
+
+static func _mcp_disabled_for_headless_launch() -> bool:
+	return _mcp_disabled_for_headless(
+		OS.get_cmdline_args(),
+		DisplayServer.get_name(),
+		OS.get_environment("GODOT_AI_ALLOW_HEADLESS")
+	)
+
+
+static func _mcp_disabled_for_headless(args: PackedStringArray, display_name: String, allow_value: String) -> bool:
+	if McpSettings.truthy(allow_value):
+		return false
+	return _args_request_headless(args) or display_name.to_lower() == "headless"
+
+
+static func _args_request_headless(args: PackedStringArray) -> bool:
+	for i in range(args.size()):
+		var arg := args[i]
+		if arg == "--headless":
+			return true
+		if arg == "--display-driver" and i + 1 < args.size() and args[i + 1] == "headless":
+			return true
+		if arg.begins_with("--display-driver=") and arg.get_slice("=", 1) == "headless":
+			return true
+	return false
+
+
+
+
+func _disable_plugin() -> void:
+	var key := "autoload/" + GAME_HELPER_AUTOLOAD_NAME
+	if not ProjectSettings.has_setting(key):
+		return
+	ProjectSettings.clear(key)
+	ProjectSettings.save()
+
+
+func _ensure_game_helper_autoload() -> void:
+	## Write the autoload directly to ProjectSettings and save immediately.
+	## EditorPlugin.add_autoload_singleton only mutates in-memory settings —
+	## the on-disk project.godot is only persisted when the editor saves
+	## (e.g. on quit). CI spawns the game subprocess before any save fires,
+	## so the child process never sees the autoload and the capture times
+	## out. Mirror AutoloadHandler's pattern: set_setting + save().
+	var key := "autoload/" + GAME_HELPER_AUTOLOAD_NAME
+	var value := "*" + GAME_HELPER_AUTOLOAD_PATH  # "*" prefix = singleton
+	if ProjectSettings.get_setting(key, "") == value:
+		return  ## already registered with the right target
+	ProjectSettings.set_setting(key, value)
+	ProjectSettings.set_initial_value(key, "")
+	ProjectSettings.set_as_basic(key, true)
+	var err := ProjectSettings.save()
+	if err != OK:
+		push_warning("MCP: failed to save project.godot after registering %s autoload (error %d)"
+			% [GAME_HELPER_AUTOLOAD_NAME, err])
+
+
+func _startup_trace_begin() -> void:
+	_startup_trace_enabled = ClientConfigurator.startup_trace_enabled()
+	if not _startup_trace_enabled:
+		return
+	_startup_trace_start_ms = Time.get_ticks_msec()
+	_startup_trace_last_ms = _startup_trace_start_ms
+	_startup_trace_netsh_start_count = WindowsPortReservation.netsh_query_count()
+	_startup_trace_counters.clear()
+	for counter in STARTUP_TRACE_COUNTER_NAMES:
+		_startup_trace_counters[counter] = 0
+	print(
+		"MCP startup trace | begin platform=%s http_port=%d ws_port=%d"
+		% [
+			OS.get_name(),
+			ClientConfigurator.http_port(),
+			ClientConfigurator.ws_port(),
+		]
+	)
+
+
+func _startup_trace_count(counter: String, amount: int = 1) -> void:
+	if not _startup_trace_enabled:
+		return
+	_startup_trace_mutex.lock()
+	_startup_trace_counters[counter] = int(_startup_trace_counters.get(counter, 0)) + amount
+	_startup_trace_mutex.unlock()
+
+
+func _startup_trace_phase(name: String) -> void:
+	if not _startup_trace_enabled:
+		return
+	var now := Time.get_ticks_msec()
+	print(
+		"MCP startup trace | phase=%s delta_ms=%d total_ms=%d"
+		% [name, now - _startup_trace_last_ms, now - _startup_trace_start_ms]
+	)
+	_startup_trace_last_ms = now
+
+
+## Call timings leave the coarse phase clock unchanged. A begin without an end
+## identifies an unfinished synchronous call, not its underlying cause.
+func _startup_trace_call_begin(name: String) -> int:
+	if not _startup_trace_enabled:
+		return 0
+	var now := Time.get_ticks_msec()
+	print("MCP startup trace | call=%s begin total_ms=%d" % [name, now - _startup_trace_start_ms])
+	return now
+
+
+func _startup_trace_call_end(name: String, started_ms: int) -> void:
+	if not _startup_trace_enabled:
+		return
+	var now := Time.get_ticks_msec()
+	print(
+		"MCP startup trace | call=%s end elapsed_ms=%d total_ms=%d"
+		% [name, now - started_ms, now - _startup_trace_start_ms]
+	)
+
+
+func _startup_trace_lookup(record: Dictionary) -> void:
+	if _startup_trace_enabled:
+		print("MCP startup trace | lookup=%s" % JSON.stringify(record))
+
+
+func _startup_trace_finish(path: String) -> void:
+	if not _startup_trace_enabled:
+		return
+	var now := Time.get_ticks_msec()
+	## Same lock as _startup_trace_count — a worker probe may still be
+	## bumping counters while this reads/writes the shared dictionary.
+	_startup_trace_mutex.lock()
+	_startup_trace_counters["netsh"] = (
+		WindowsPortReservation.netsh_query_count() - _startup_trace_netsh_start_count
+	)
+	var counters_snapshot: Dictionary = _startup_trace_counters.duplicate()
+	_startup_trace_mutex.unlock()
+	print(
+		"MCP startup trace | done path=%s total_ms=%d counters=%s"
+		% [path, now - _startup_trace_start_ms, str(counters_snapshot)]
+	)
+
+
+func _start_server() -> void:
+	if not _normal_start_released:
+		push_error("MCP | server start refused before normal startup release")
+		return
+	_lifecycle.start_server()
+
+
+func _capture_lifecycle_plan() -> Dictionary:
+	var policy := _endpoint_policy.duplicate(true)
+	var http_port := int(policy.get("http_port", ClientConfigurator.DEFAULT_HTTP_PORT))
+	var worktree_src := ""
+	var worktree_started := _startup_trace_call_begin("worktree_source")
+	if ClientConfigurator.is_dev_checkout():
+		worktree_src = ClientConfigurator.find_worktree_src_dir(
+			ProjectSettings.globalize_path("res://")
+		)
+	_startup_trace_call_end("worktree_source", worktree_started)
+	var expected_version := ClientConfigurator.get_plugin_version()
+	var command_started := _startup_trace_call_begin("server_command")
+	var lookup_trace := _startup_trace_lookup if _startup_trace_enabled else Callable()
+	var server_command := ClientConfigurator.get_server_command(lookup_trace)
+	_startup_trace_call_end("server_command", command_started)
+	var pid_file := ProjectSettings.globalize_path(PortResolver.SERVER_PID_FILE)
+	var startup_report := ProjectSettings.globalize_path(PortResolver.SERVER_STARTUP_REPORT)
+	var reservation_started := _startup_trace_call_begin("http_port_reservation")
+	var http_port_reserved := WindowsPortReservation.is_port_excluded(http_port)
+	_startup_trace_call_end("http_port_reservation", reservation_started)
+	return {
+		"http_port": http_port,
+		"capability_path": str(policy.get("capability_path", "")),
+		"ws_port": int(policy.get("ws_port", ClientConfigurator.DEFAULT_WS_PORT)),
+		"expected_version": expected_version,
+		"server_command": server_command,
+		"pid_file": pid_file,
+		"startup_report": startup_report,
+		"http_port_reserved": http_port_reserved,
+		"excluded_domains": str(policy.get("excluded_domains", "")),
+		"allow_hosts": str(policy.get("allow_hosts", "")),
+		"keep_alive": bool(policy.get("keep_alive", false)),
+		"worktree_src": worktree_src,
+		"ambient_pythonpath": OS.get_environment("PYTHONPATH"),
+		"disable_telemetry": not bool(policy.get("telemetry_enabled", true)),
+		"automatic_effects": true,
+		"defer_effects": true,
+	}
+
+
+static func _supports_godot_version(version_info: Dictionary) -> bool:
+	var major := int(version_info.get("major", 0))
+	var minor := int(version_info.get("minor", 0))
+	return major == MIN_GODOT_MAJOR and minor >= MIN_GODOT_MINOR
+
+
+func _on_lifecycle_snapshot_changed(snapshot: Dictionary) -> void:
+	if int(snapshot.get("episode_id", 0)) != _post_update_retry_episode or str(snapshot.get("episode_state", "")) != "BLOCKED":
+		_post_update_retry_episode = 0
+	if _connection != null and bool(snapshot.get("connection_blocked", true)):
+		_connection.connect_blocked = true
+		_connection.connect_block_reason = str(snapshot.get("message", ""))
+	_replace_server_left_by_update(snapshot)
+	_log_lifecycle_block(snapshot)
+	if _client_jobs != null:
+		_client_jobs.set_client_health_blocked(
+			ServerStateScript.blocks_client_health(
+				int(snapshot.get("state", ServerStateScript.UNINITIALIZED))
+			)
+		)
+	_publish_dock_status_snapshots()
+
+
+## The dock shows why a server start blocked; the editor log should too, once
+## per distinct reason, so a report from the field carries it.
+func _log_lifecycle_block(snapshot: Dictionary) -> void:
+	if str(snapshot.get("episode_state", "")) != "BLOCKED":
+		_last_logged_block = ""
+		return
+	var message := str(snapshot.get("message", ""))
+	if message.is_empty() or message == _last_logged_block:
+		return
+	_last_logged_block = message
+	var retry_pending := bool(_lifecycle_snapshot_for_dock().get("handoff_retry_pending", false))
+	print("MCP | %s: %s" % ["server handoff retry pending" if retry_pending else "server start blocked", message])
+
+
+## Once, right after an update: a godot-ai server at the version we just
+## replaced is on our port (typically spawned by an attach bridge that lost
+## server A during the restart). Replace it instead of asking the user to.
+## Any other conflict keeps the dock's explicit Restart Server authority.
+func _replace_server_left_by_update(snapshot: Dictionary) -> void:
+	if _post_update_replaced_version.is_empty():
+		return
+	if not bool(snapshot.get("connection_blocked", true)):
+		_post_update_replaced_version = ""
+		return
+	if not bool(snapshot.get("can_recover_incompatible", false)):
+		## Any other block right after an update is the bridge's backend in
+		## flight: bound but not answering yet, or bound between our probe and
+		## our launch so our server exited on bind. Probe again shortly, a
+		## bounded number of times; the re-probe finds that backend answering
+		## and takes the replacement path. Then the dock's Restart Server is
+		## the remaining path.
+		if str(snapshot.get("episode_state", "")) != "BLOCKED":
+			return
+		var episode_id := int(snapshot.get("episode_id", 0))
+		if episode_id <= 0 or episode_id == _post_update_retry_episode:
+			return
+		if str(snapshot.get("blocked_hint", "")) == ServerLifecycleManager.STALE_PRE_V4_HINT:
+			if _post_update_stale_reprobes_left <= 0:
+				return
+			if _post_update_stale_reprobes_left == POST_UPDATE_STALE_REPROBE_LIMIT:
+				print(
+					"MCP | a pre-v4 godot-ai server holds port %d; waiting for it to exit once its AI client is relaunched"
+					% int(snapshot.get("conflict_port", 0))
+				)
+			_post_update_stale_reprobes_left -= 1
+			_post_update_retry_episode = episode_id
+			get_tree().create_timer(POST_UPDATE_STALE_REPROBE_SECONDS).timeout.connect(
+				_reprobe_after_update.bind(episode_id), CONNECT_ONE_SHOT
+			)
+			return
+		if _post_update_reprobes_left > 0:
+			_post_update_reprobes_left -= 1
+			_post_update_retry_episode = episode_id
+			get_tree().create_timer(1.0).timeout.connect(_reprobe_after_update.bind(episode_id), CONNECT_ONE_SHOT)
+		return
+	var version := str(snapshot.get("conflict_version", ""))
+	if not _update_may_replace(version):
+		return
+	if _post_update_replacements_left <= 0:
+		return
+	_post_update_replacements_left -= 1
+	print(
+		"MCP | replacing the v%s server left on port %d by the update"
+		% [version, int(snapshot.get("conflict_port", 0))]
+	)
+	if not _lifecycle.request_replacement():
+		push_warning(
+			"MCP | could not replace the v%s server automatically; use Restart Server in the dock"
+			% version
+		)
+
+
+## The server the update superseded, or any older server of our major
+## version an attach bridge left on the port (a client pinned further back).
+## Never a newer one: that is another editor's server, and adoption or the
+## dock's explicit Restart Server decides there.
+func _update_may_replace(conflict_version: String) -> bool:
+	if conflict_version.is_empty():
+		return false
+	if conflict_version == _post_update_replaced_version:
+		return true
+	return McpServerVersionCheck.is_older_same_major(
+		conflict_version, ClientConfigurator.get_plugin_version()
+	)
+
+
+func _reprobe_after_update(episode_id: int) -> void:
+	if episode_id != _post_update_retry_episode:
+		return
+	_post_update_retry_episode = 0
+	if _post_update_replaced_version.is_empty() or _lifecycle == null or not _normal_start_released:
+		_publish_dock_status_snapshots()
+		return
+	var snapshot: Dictionary = _lifecycle.get_status_dict()
+	if int(snapshot.get("episode_id", 0)) != episode_id or str(snapshot.get("episode_state", "")) != "BLOCKED":
+		_publish_dock_status_snapshots()
+		return
+	_lifecycle.start_server()
+
+
+func _on_lifecycle_transport_ready(ws_port: int, ws_capability: String) -> void:
+	_set_resolved_ws_port(ws_port)
+	if _client_jobs != null:
+		_client_jobs.set_client_health_blocked(false)
+		_client_jobs.request_status_refresh(ClientConfigurator.client_ids(), true)
+	if _connection != null:
+		_connection.authorize_transport(ws_port, ws_capability)
+	_publish_dock_status_snapshots()
+
+
+func _on_lifecycle_transport_cleared(reason: String) -> void:
+	if _connection != null:
+		_connection.revoke_transport(reason)
+	_publish_dock_status_snapshots()
+
+
+## Snapshot of the server-spawn outcome for the dock.
+##
+## `state` is one of the `McpServerState.*` int constants; the dock owns
+## the UI copy per state via its own `_crash_body_for_state`. `exit_ms`
+## is only meaningful for `CRASHED`.
+func get_server_status() -> Dictionary:
+	return _lifecycle.get_status_dict()
+
+
+## Diagnostic accessor for the Dock. Positive means this lifecycle owns an
+## exact process grant; adoption always reports -1 and cannot authorize stop.
+func get_server_pid() -> int:
+	return _lifecycle.get_server_pid()
+
+
+func get_resolved_ws_port() -> int:
+	return _resolved_ws_port
+
+
+func _set_resolved_ws_port(port: int) -> void:
+	var policy := _endpoint_policy.duplicate(true)
+	if policy.is_empty():
+		policy = ClientConfigurator.capture_endpoint_policy(port)
+	policy["ws_port"] = port
+	_set_endpoint_policy(policy)
+	if _connection != null:
+		_connection.ws_port = port
+
+
+func _set_endpoint_policy(policy: Dictionary) -> void:
+	_endpoint_policy = policy.duplicate(true)
+	_resolved_ws_port = int(_endpoint_policy.get(
+		"ws_port", ClientConfigurator.DEFAULT_WS_PORT
+	))
+	ClientConfigurator.capture_launch_context(_endpoint_policy)
+
+
+func _resolve_ws_port(configured_port: int) -> int:
+	return PortResolver.resolve_ws_port(
+		configured_port,
+		ClientConfigurator.MAX_PORT,
+		_log_buffer,
+	)
+
+
+func prepare_for_update_reload() -> Dictionary:
+	## Refuse while frame-yielding work is still live, before stopping any
+	## owner. These probes are non-mutating; retry after the work completes.
+	if _dispatcher != null:
+		var handlers_ready: Dictionary = _dispatcher.quiesce_for_script_swap()
+		if not bool(handlers_ready.get("ok", false)):
+			return handlers_ready
+	if _debugger_plugin != null:
+		var debugger_ready: Dictionary = _debugger_plugin.quiesce_for_script_swap()
+		if not bool(debugger_ready.get("ok", false)):
+			return debugger_ready
+	## Stop the exact managed process only after the non-mutating probes.
+	var lifecycle_quiesced: Dictionary = _lifecycle.prepare_for_update_reload()
+	if not bool(lifecycle_quiesced.get("ok", false)):
+		return lifecycle_quiesced
+	if _vision_routing != null:
+		_vision_routing.shutdown()
+	if _dispatcher != null:
+		var quiesced: Dictionary = _dispatcher.quiesce_for_script_swap()
+		if not bool(quiesced.get("ok", false)):
+			quiesced["reload_required"] = true
+			return quiesced
+		var cleared: Dictionary = _dispatcher.clear()
+		if not bool(cleared.get("ok", false)):
+			cleared["reload_required"] = true
+			return cleared
+	return {"ok": true}
+
+
+## Refuse to start a download while an earlier update is unresolved or another
+## live editor holds this project's update lock. The lock is taken here, before
+## the download, and released by every failure path before the swap.
+func _preflight_update() -> Dictionary:
+	var pending: Dictionary = UpdateInstaller.read_pending()
+	var status := str(pending.get("status", ""))
+	if status == "swapped" or status == "repair_required":
+		return {"ok": false, "error": "an earlier update is unresolved (%s)" % status, "download_root": ""}
+	var pid := OS.get_process_id()
+	var lock: Dictionary = UpdateInstaller.acquire_lock(pid, McpPortResolver.process_fingerprint(pid))
+	if not bool(lock.get("ok", false)):
+		return {"ok": false, "error": str(lock.get("error", "")), "download_root": ""}
+	var download_root := ProjectSettings.globalize_path("user://godot_ai_update/download").trim_suffix("/")
+	if DirAccess.dir_exists_absolute(download_root):
+		_remove_tree(download_root)
+	if DirAccess.make_dir_recursive_absolute(download_root) != OK:
+		UpdateInstaller.release_lock()
+		return {"ok": false, "error": "could not create the download directory", "download_root": ""}
+	return {"ok": true, "error": "", "download_root": download_root}
+
+
+static func _remove_tree(path: String) -> void:
+	var dir := DirAccess.open(path)
+	if dir == null:
+		return
+	dir.include_hidden = true
+	for name in dir.get_directories():
+		_remove_tree(path.path_join(name))
+	for name in dir.get_files():
+		DirAccess.remove_absolute(path.path_join(name))
+	DirAccess.remove_absolute(path)
+
+
+## Verify, stage, quiesce, then hand activation to an independent runner. Every check runs in this editor
+## against the downloaded bytes; nothing outside the editor is executed. The
+## live tree is touched only by the two renames inside `swap`, and only after
+## the staged tree has been re-hashed against the signed manifest.
+## Activation runs on the main thread: verification hashes the archive,
+## staging extracts it, and the worker quiescence waits for threads. Each
+## phase names itself in the dock and yields one frame first so the label
+## repaints; without that the dock sat on "Downloading…" for seconds after
+## the download had finished, looking frozen.
+func install_downloaded_update(package: Dictionary) -> void:
+	await _present_install_phase("Verifying signed update…")
+	var manifest_bytes := FileAccess.get_file_as_bytes(str(package.get("manifest", "")))
+	var signature := FileAccess.get_file_as_bytes(str(package.get("signature", "")))
+	var verified: Dictionary = ReleaseVerifier.verify_manifest(
+		manifest_bytes,
+		signature,
+		{
+			"repository": str(package.get("repository", "")),
+			"channel": str(package.get("channel", "")),
+			"version": str(package.get("version", "")),
+			"current_version": ClientConfigurator.get_plugin_version(),
+		},
+		UpdateManager.RELEASE_SIGNING_PUBLIC_KEY_PEM,
+	)
+	var manifest: Dictionary = verified.get("manifest", {})
+	var checked: Dictionary = verified
+	if bool(verified.get("ok", false)):
+		checked = ReleaseVerifier.verify_archive(str(package.get("archive", "")), manifest)
+	if not bool(checked.get("ok", false)):
+		_fail_update("Update verification failed", "signed update refused: %s" % str(checked.get("error", "")))
+		return
+	await _present_install_phase("Staging the verified tree…")
+	var staged: Dictionary = UpdateInstaller.stage(str(package.get("archive", "")), manifest)
+	if not bool(staged.get("ok", false)):
+		_fail_update("Update staging failed", "update staging refused: %s" % str(staged.get("error", "")))
+		return
+	if _update_manager != null:
+		_update_manager.discard_downloads()
+	await _present_install_phase("Waiting for client workers…")
+	if _client_jobs != null:
+		var jobs_quiesced: Dictionary = _client_jobs.quiesce(
+			Time.get_ticks_msec() + ClientConfigurator.PREWARM_TIMEOUT_MS
+		)
+		if not bool(jobs_quiesced.get("ok", false)):
+			UpdateInstaller.discard_stage()
+			_fail_update("Update cancelled safely", "client workers refused update quiescence")
+			return
+	var script_quiesced := prepare_for_update_reload()
+	if not bool(script_quiesced.get("ok", false)):
+		UpdateInstaller.discard_stage()
+		_fail_update("Update cancelled safely", "command workers refused update quiescence")
+		if bool(script_quiesced.get("reload_required", false)):
+			_reload_plugin_after_failed_update()
+		return
+	_on_update_install_state_changed({
+		"install_in_flight": true,
+		"status_text": "Activating verified update…",
+		"button_disabled": true,
+	})
+	var to_version := str(manifest.get("version", ""))
+	var record := {
+		"from_version": ClientConfigurator.get_plugin_version(),
+		"to_version": to_version,
+		"manifest_sha256": ReleaseVerifier.sha256_bytes(manifest_bytes),
+		"expected_tree_sha256": str(staged.get("tree_sha256", "")),
+		"editor_nonce": Crypto.new().generate_random_bytes(16).hex_encode(),
+		"replace_owned_mismatches": false,
+	}
+	## Compile an independent script with no resource path. Loading this as a
+	## normal Script would let the filesystem scan replace our live runner.
+	var runner_script := GDScript.new()
+	runner_script.source_code = FileAccess.get_file_as_string(
+		"res://addons/godot_ai/utils/update_activation_runner.gd"
+	)
+	if runner_script.source_code.is_empty() or runner_script.reload() != OK:
+		UpdateInstaller.discard_stage()
+		_fail_update("Update cancelled safely", "could not compile the independent activation runner")
+		_reload_plugin_after_failed_update()
+		return
+	var runner = runner_script.new()
+	get_tree().root.add_child(runner)
+	if not runner.start({"stage_root": str(staged.get("stage_root", "")), "record": record}):
+		var refusal_reason := str(runner.refusal_reason)
+		runner.queue_free()
+		UpdateInstaller.discard_stage()
+		_fail_update("Update cancelled safely", refusal_reason)
+		_reload_plugin_after_failed_update()
+		return
+	## The runner now owns the lock. Teardown's cancellation signal must not
+	## release it before the deferred disable/drain/swap sequence completes.
+	_update_swapped = true
+	## Return: no frame of this plugin may be suspended across source replacement.
+
+
+
+## Name the activation phase in the dock and let it repaint before the
+## phase's main-thread work begins.
+func _present_install_phase(status_text: String) -> void:
+	_on_update_install_state_changed({
+		"install_in_flight": true,
+		"status_text": status_text,
+		"button_disabled": true,
+	})
+	var tree := get_tree()
+	if tree != null:
+		await tree.process_frame
+
+
+func _fail_update(status_text: String, error: String) -> void:
+	if _update_manager != null:
+		_update_manager.discard_downloads()
+	push_error("MCP | %s" % error)
+	_on_update_install_state_changed({
+		"install_in_flight": false,
+		"status_text": status_text,
+		"button_disabled": false,
+	})
+
+
+func _reload_plugin_after_failed_update() -> void:
+	## The signed prepared tree was aborted before mutation. Reconstruct the
+	## unchanged old composition if any later quiescence step had already
+	## stopped vision or released handler references. The reload frees this
+	## plugin, so it must not run on one of this plugin's own frames: defer
+	## the static call itself, not a method of this instance.
+	PluginReload.reload_enabled_plugin.call_deferred()
+
+
+func can_recover_incompatible_server() -> bool:
+	return _normal_start_released and _lifecycle.can_recover_incompatible_server()
+
+
+func recover_incompatible_server(_user_initiated: bool = true, _stale_version: String = "") -> bool:
+	## The Dock click is the sole source of replacement authority. The manager
+	## binds, spends, and discards one authorization for this exact target.
+	if not _normal_start_released:
+		return false
+	return _lifecycle.request_replacement()
+
+
+## Managed restart uses the exact owned grant. An unowned incompatible server
+## can only reach replacement through the separate explicit Dock intent.
+func force_restart_server() -> bool:
+	if not _normal_start_released:
+		return false
+	return _lifecycle.force_restart_server()
+
+
+## Developer controls use the same lifecycle owner as ordinary startup. The
+## plugin may restart only its exact process grant; a compatible external
+## server is adopted for transport but remains the launcher's responsibility.
+func restart_or_start_managed_server() -> bool:
+	if not _normal_start_released:
+		return false
+	if has_managed_server():
+		_lifecycle.force_restart_server()
+		return true
+	var port := ClientConfigurator.http_port()
+	var occupied: bool
+	if OS.get_name() == "Windows":
+		var occupancy := PortResolver.windows_port_occupancy(port)
+		if occupancy == PortResolver.PortOccupancy.UNKNOWN:
+			_lifecycle.start_server()
+			return true
+		occupied = occupancy == PortResolver.PortOccupancy.OCCUPIED
+	else:
+		occupied = PortResolver.is_port_in_use(port)
+	if occupied:
+		push_warning(
+			"MCP | refusing to restart the unowned server on port %d; stop it from its launcher"
+			% port
+		)
+		return false
+	_lifecycle.start_server()
+	return true
+
+
+func stop_managed_server() -> void:
+	if has_managed_server():
+		_lifecycle.stop_server()
+
+
+func has_managed_server() -> bool:
+	## Returns true if the plugin is currently managing a server process it spawned.
+	return _lifecycle.has_managed_server()
+
+
+func can_restart_managed_server() -> bool:
+	## Restart needs an owned grant or a currently replaceable blocked target.
+	return _normal_start_released and _lifecycle.can_restart_managed_server()
+
+
+func _on_custom_tools_changed() -> void:
+	if _connection == null:
+		push_warning("MCP | connection isn't established")
+		return
+	var tool_list: Array[Dictionary] = []
+	## Send all definitions plus their state: the server hides disabled tools
+	## from fresh tools/list responses but retains a callable tombstone so a
+	## client using a cached promoted name receives CUSTOM_TOOL_DISABLED.
+	for spec in _custom_tool_registry.all():
+		tool_list.append({
+			"name": spec.name,
+			"description": spec.description,
+			"params_schema": spec.params_schema,
+			"source": spec.source,
+			"deferred": spec.deferred,
+			"timeout_ms": spec.timeout_ms,
+			"requires_writable": spec.requires_writable,
+			"undoable": spec.undoable,
+			"promoted": spec.promoted,
+			"enabled": _custom_tool_registry.is_tool_enabled(spec.name)
+		})
+	_connection.send_event("custom_tools_changed", {"tools": tool_list})
+
+
+## On (re)connect, replay the current custom-tool catalog so tools
+## registered before the initial connection or during a disconnect
+## window reach the server. send_event silently drops while
+## _connected is false (connection.gd::_send_json), so without this
+## replay those tools only surface on the next registry mutation.
+func _on_connection_state_changed(is_open: bool) -> void:
+	if is_open:
+		_lifecycle.transport_authenticated(_connection.server_version)
+		if _custom_tool_registry != null:
+			_on_custom_tools_changed()
+	else:
+		_lifecycle.transport_lost()

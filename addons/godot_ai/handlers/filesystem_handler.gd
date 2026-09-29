@@ -1,0 +1,336 @@
+@tool
+extends "res://addons/godot_ai/handlers/command_handler.gd"
+
+const ErrorCodes := preload("res://addons/godot_ai/utils/error_codes.gd")
+const ScriptHandler := preload("res://addons/godot_ai/handlers/script_handler.gd")
+
+## Handles file read/write operations and reimport within the Godot project.
+
+## Bounds for the deferred scan wait. `write_file`/`reimport` register single
+## files with `update_file()` (cheap, no global-class rebuild); `scan_filesystem`
+## is the heavier, explicit "rebuild the class registry" path agents call after
+## adding `class_name` scripts headlessly (no window focus to trigger it).
+## Kept under the dispatcher's "scan_filesystem" deferred timeout (30s) so we
+## always send a real reply before a DEFERRED_TIMEOUT is synthesised.
+const _SCAN_START_GRACE_MSEC := 750
+const _SCAN_SETTLE_MAX_MSEC := 28000
+
+## Sidecar the editor writes next to every imported resource. `reimport` reads
+## it to tell imported assets from files that merely have a filesystem entry
+## (see `_is_imported_resource`).
+const IMPORT_SIDECAR_SUFFIX := ".import"
+
+## Shared single-flight latch for scan_filesystem. `is_scanning()` alone can't
+## enforce single-flight: `EditorFileSystem.scan()` doesn't flip `is_scanning()`
+## for a frame or two (hence _SCAN_START_GRACE_MSEC), so a second request landing
+## in that window would observe `false` and stack another scan() — the exact
+## stacked-worker SIGABRT this op exists to avoid (dsarno/godot#6). The latch is
+## set before the first scan() and cleared when its settle coroutine finishes;
+## concurrent requests coalesce onto the running scan instead of starting one.
+## `static` so it's shared across handler instances; it resets on plugin reload
+## (script re-parse), which self-heals any latch orphaned by a mid-await teardown.
+static var _scan_in_flight := false
+
+var _connection: McpConnection
+
+
+func _init(connection: McpConnection = null) -> void:
+	_connection = connection
+
+
+func read_file(params: Dictionary) -> Dictionary:
+	var path: String = params.get("path", "")
+
+	var path_err = McpPathValidator.path_error(path, "path")
+	if path_err != null:
+		return path_err
+
+	if not FileAccess.file_exists(path):
+		return ErrorCodes.make(ErrorCodes.RESOURCE_NOT_FOUND, "File not found: %s" % path)
+
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		return ErrorCodes.make(ErrorCodes.INTERNAL_ERROR, "Failed to open file: %s" % path)
+
+	var content := file.get_as_text()
+	file.close()
+
+	return {
+		"data": {
+			"path": path,
+			"content": content,
+			"size": content.length(),
+			"line_count": content.count("\n") + (1 if not content.is_empty() else 0),
+		}
+	}
+
+
+func write_file(params: Dictionary) -> Dictionary:
+	var path: String = params.get("path", "")
+	var content: String = params.get("content", "")
+
+	var path_err = McpPathValidator.path_error(path, "path", true)
+	if path_err != null:
+		return path_err
+
+	var existed_before := FileAccess.file_exists(path)
+
+	# Shared write path (#714): parent mkdir + write/flush + explicit error
+	# check live on McpResourceIO so this can't drift from create_script.
+	var write_failure: Variant = McpResourceIO.write_text_to_disk(path, content)
+	if write_failure != null:
+		return write_failure
+
+	# Single-file register, not a full scan() — a scan() per write stacks
+	# filesystem WorkerThreadPool tasks under concurrent writes and can SIGABRT
+	# in the global-class update (see dsarno/godot#6 and create_script in
+	# script_handler.gd). update_file() is what reimport()/material/theme use.
+	var efs := EditorInterface.get_resource_filesystem()
+	if efs != null:
+		efs.update_file(path)
+
+	var data := {
+		"path": path,
+		"size": content.length(),
+		"undoable": false,
+		"reason": "File system operations cannot be undone via editor undo",
+	}
+	var is_gdscript := path.ends_with(".gd")
+	## A .gd written through the filesystem tool used to skip the parse
+	## diagnostics create_script attaches (#714) — the agent's broken
+	## script reported plain success and the parse error surfaced only in
+	## later editor logs. Same shared check, same response fields. A bare
+	## ScriptHandler works here: the diagnostics path touches no instance
+	## state (it stays an instance method only for test stubbing).
+	if is_gdscript:
+		ScriptHandler.new(null)._attach_gdscript_diagnostics(data, path, content)
+		data["committed"] = true
+		data["import_settled"] = existed_before
+		data["import_settle"] = "already_known" if existed_before else "not_waited"
+	McpResourceIO.attach_cleanup_hint(data, existed_before, [path])
+
+	## Fresh `.gd` writes take create_script's import-settle deferral (#714,
+	## #261): reply only once ResourceLoader can see the new resource (or the
+	## bounded window elapses), so write_file -> script_attach back-to-back
+	## can't 404 on the not-yet-imported script. This CHANGES write_file's
+	## response timing for that case — the reply lands up to
+	## McpResourceIO.IMPORT_SETTLE_MAX_MSEC later instead of immediately.
+	## Scoped to .gd: ResourceLoader never learns plain text files, so an
+	## unconditional wait would burn the full window on every fresh .txt.
+	## Overwrites, batch_execute (no request_id) and unit-test contexts (no
+	## connection) keep the synchronous reply.
+	var request_id: String = params.get("_request_id", "")
+	if is_gdscript and not existed_before and _connection != null and not request_id.is_empty():
+		McpResourceIO.finish_text_write_deferred(_connection, request_id, path, data)
+		return McpDispatcher.DEFERRED_RESPONSE
+
+	return {"data": data}
+
+
+func reimport(params: Dictionary) -> Dictionary:
+	var paths: Array = params.get("paths", [])
+
+	if paths.is_empty():
+		return ErrorCodes.make(ErrorCodes.MISSING_REQUIRED_PARAM, "Missing required param: paths (non-empty array)")
+
+	var efs := EditorInterface.get_resource_filesystem()
+	if efs == null:
+		return ErrorCodes.make_not_ready(
+			ErrorCodes.SUB_EDITOR_UNAVAILABLE,
+			"EditorFileSystem not available", false)
+
+	var reimported: Array[String] = []
+	var skipped_non_imported: Array[String] = []
+	var not_found: Array[String] = []
+
+	for path_variant in paths:
+		var path: String = str(path_variant)
+		var path_err := McpPathValidator.validate_resource_path(path)
+		if not path_err.is_empty():
+			not_found.append("%s (%s)" % [path, path_err])
+			continue
+		if not FileAccess.file_exists(path):
+			not_found.append("%s (file does not exist)" % path)
+			continue
+		efs.update_file(path)
+		if _is_imported_resource(path):
+			reimported.append(path)
+		else:
+			skipped_non_imported.append(path)
+
+	var data := {
+		"reimported": reimported,
+		"skipped_non_imported": skipped_non_imported,
+		"not_found": not_found,
+		"reimported_count": reimported.size(),
+		"skipped_non_imported_count": skipped_non_imported.size(),
+		"not_found_count": not_found.size(),
+		"undoable": false,
+		"reason": "Reimport is a file system operation",
+	}
+	## Only when it applies: a hint on every call would cost tokens on the
+	## all-assets path this op is actually for.
+	if not skipped_non_imported.is_empty():
+		data["skipped_non_imported_hint"] = (
+			"%d path(s) are not imported resources. Their editor filesystem entry was "
+			+ "refreshed, but no import ran — a success here is not evidence that a "
+			+ "script parsed or that diagnostics were produced. Use script_patch/"
+			+ "script_create for GDScript diagnostics, or filesystem_manage(op=\"scan\") "
+			+ "for an asset the editor has not imported yet."
+		) % skipped_non_imported.size()
+	return {"data": data}
+
+
+## #778: `update_file()` registers a path with the resource pipeline; it only
+## runs an *import* for files that have one. Scripts, scenes and hand-written
+## `.tres` are not imported resources, so listing them under `reimported` reads
+## as proof that a parse or import ran when nothing did.
+##
+## The `.import` sidecar is the editor's own record that a path goes through
+## the import pipeline, so it decides the split. An extension allow-list was
+## rejected: importers come and go with plugins, so the list would drift out of
+## agreement with the editor it claims to describe.
+##
+## Known edge: an asset the editor has never imported (just written, no scan
+## yet) has no sidecar and reports as non-imported. That is accurate at the
+## moment of the call — `update_file()` did not import it either — and the
+## hint names `scan` as the way through.
+##
+## Behaviour is unchanged for every path: `update_file()` still runs on all of
+## them, because refreshing an externally-edited `.tscn`/`.tres` is a real use
+## of this op. This splits the report, not the work.
+static func _is_imported_resource(path: String) -> bool:
+	if path.ends_with(IMPORT_SIDECAR_SUFFIX):
+		return false  ## The sidecar itself is not an imported resource.
+	return FileAccess.file_exists(path + IMPORT_SIDECAR_SUFFIX)
+
+
+## Force a full EditorFileSystem scan and wait for it to settle. This is the
+## headless equivalent of the editor regaining window focus: `update_file()`
+## (used by write_file/reimport/script_create) registers a single file with the
+## resource pipeline but does NOT rebuild the global `class_name` table, so a
+## freshly-created `class_name MyThing extends Resource` stays invisible to
+## `ClassDB`/`ProjectSettings.get_global_class_list()` until a scan runs. Agents
+## driving the editor without focus call this once after a batch of script
+## creates to make new types instantiable/referenceable. See issue #83.
+func scan_filesystem(params: Dictionary) -> Dictionary:
+	var efs := EditorInterface.get_resource_filesystem()
+	if efs == null:
+		return ErrorCodes.make_not_ready(
+			ErrorCodes.SUB_EDITOR_UNAVAILABLE,
+			"EditorFileSystem not available", false)
+
+	var request_id: String = params.get("_request_id", "")
+	# Async path: a scan can't be awaited on the calling frame without freezing
+	# the editor, so hand control back to the dispatcher (DEFERRED_RESPONSE) and
+	# push the real reply from a static coroutine once the scan settles — by
+	# which point new class_names are registered.
+	if _connection != null and not request_id.is_empty():
+		_finish_scan_deferred(_connection, request_id, efs)
+		return McpDispatcher.DEFERRED_RESPONSE
+
+	# Synchronous fallback: batch_execute (no request_id) and unit-test contexts
+	# (no connection) can't await, so kick a single-flight scan and return
+	# immediately without the settle confirmation. Respect the latch so we don't
+	# stack onto a deferred scan; don't set it (there's no coroutine here to
+	# clear it — the brief is_scanning() window covers the rest).
+	var already := _scan_in_flight or efs.is_scanning()
+	if not already:
+		efs.scan()
+	return {
+		"data": {
+			"scan_completed": false,
+			"scan_settle": "not_waited",
+			"was_already_scanning": already,
+			"global_class_count": ProjectSettings.get_global_class_list().size(),
+			# Present in both paths for a consistent response shape; the sync
+			# path doesn't await, so it can't measure a delta.
+			"global_classes_registered_delta": 0,
+			"undoable": false,
+			"reason": "Filesystem scan is an editor operation",
+		}
+	}
+
+
+## `static` is load-bearing for the same reason as ScriptHandler's deferred
+## finish: the coroutine must outlive the handler RefCounted, which can be freed
+## mid-await (e.g. an editor_reload_plugin fired during the scan). Parameterise
+## everything; reference no instance state.
+static func _finish_scan_deferred(
+	connection: McpConnection,
+	request_id: String,
+	efs: EditorFileSystem,
+) -> void:
+	var work := ScriptWork.begin("scan_filesystem")
+	await _settle_scan(connection, request_id, efs)
+	ScriptWork.finish(work)
+
+
+static func _settle_scan(
+	connection: McpConnection, request_id: String, efs: EditorFileSystem,
+) -> void:
+	if not is_instance_valid(connection):
+		return
+	var tree := connection.get_tree()
+	if tree == null:
+		return
+	var classes_before := ProjectSettings.get_global_class_list().size()
+	# Single-flight via the shared `_scan_in_flight` latch (NOT is_scanning(),
+	# which lags scan() by a frame or two — see the latch declaration). Only the
+	# request that sets the latch calls scan(); concurrent requests coalesce and
+	# just await the running scan. This is what actually prevents the stacked
+	# scan() SIGABRT (dsarno/godot#6), even within the start-grace window.
+	var was_already_scanning := _scan_in_flight or efs.is_scanning()
+	var we_started := not was_already_scanning
+	if we_started:
+		_scan_in_flight = true
+		efs.scan()
+	# Hand back a frame so _dispatch() registers this request as deferred before
+	# the coroutine can push a reply (mirrors McpResourceIO.finish_text_write_deferred).
+	await tree.process_frame
+	var deadline_ms := Time.get_ticks_msec() + _SCAN_SETTLE_MAX_MSEC
+	var start_grace_ms := Time.get_ticks_msec() + _SCAN_START_GRACE_MSEC
+	var saw_scanning := efs.is_scanning()
+	while Time.get_ticks_msec() < deadline_ms:
+		if efs.is_scanning():
+			saw_scanning = true
+		elif saw_scanning or Time.get_ticks_msec() > start_grace_ms:
+			# Either the scan ran and finished, or it never flipped is_scanning()
+			# within the grace window (a no-op scan because nothing changed).
+			break
+		await tree.process_frame
+	# Clear the latch in all paths (no try/finally in GDScript): do it before the
+	# is_instance_valid early-return so a freed connection can't orphan it.
+	if we_started:
+		_scan_in_flight = false
+	if not is_instance_valid(connection):
+		return
+	var completed := not efs.is_scanning()
+	var classes_after := ProjectSettings.get_global_class_list().size()
+	connection.send_deferred_response(request_id, {
+		"data": {
+			"scan_completed": completed,
+			"scan_settle": "settled" if completed else "timeout",
+			"was_already_scanning": was_already_scanning,
+			"global_class_count": classes_after,
+			"global_classes_registered_delta": classes_after - classes_before,
+			"undoable": false,
+			"reason": "Filesystem scan is an editor operation",
+		}
+	})
+
+
+## Resource-group mutations use read-only deferred discovery before disk effects.
+const Mutation := preload("res://addons/godot_ai/handlers/filesystem_mutation.gd")
+
+
+func move_file(params: Dictionary) -> Dictionary:
+	return Mutation.start(_connection, params, "move")
+
+
+func rename_file(params: Dictionary) -> Dictionary:
+	return Mutation.start(_connection, params, "rename")
+
+
+func remove_file(params: Dictionary) -> Dictionary:
+	return Mutation.start(_connection, params, "remove")
